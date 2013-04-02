@@ -1,0 +1,1 @@
+A fast search application for windows, written in C++, using pure windows API (no framework).
