@@ -9,12 +9,12 @@ class FileOperationProgressSink :
 {
 public:
 	FileOperationProgressSink(void);
-	~FileOperationProgressSink(void);//::IUnknown::Release;
+	~FileOperationProgressSink(void);
 
 	ULONG __stdcall Release();
-//	template <class Q> HRESULT __stdcall QueryInterface(Q** pp);
 	HRESULT __stdcall QueryInterface(const IID &riid, void** ppvObject);
 	ULONG __stdcall AddRef();
+
 	HRESULT __stdcall PauseTimer();
 	HRESULT __stdcall ResetTimer();
 	HRESULT __stdcall ResumeTimer();

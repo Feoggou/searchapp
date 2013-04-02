@@ -1,3 +1,5 @@
+//#define _WIN32_WINNT	0x0400
+
 #include "SearchAppDlg.h"
 #include "resource.h"
 #include "DataObject.h"
@@ -5,7 +7,13 @@
 #include "OptionsDlg.h"
 #include "AboutDlg.h"
 
-#define TESTING
+#include <filterr.h>
+
+#define SEARCH_TASK_ICON	0x00FF
+#define WM_TRAYICONMSG		WM_USER + 20
+#define WM_TARYICON_DESTROY WM_USER + 21
+
+//#define TESTING
 
 #ifdef TESTING
 #define TESTING_SEARCHIN L"D:\\poze\\test"
@@ -13,16 +21,32 @@
 
 #define INFIDEL
 #define IDM_ABOUT 0xFFFE
+#define WM_SHELLNOTIFY	WM_USER + 200
 
 extern HINSTANCE hAppInstance;
 IContextMenu3* pContextMenu = NULL;
 HWND hMainDlg;
 
 WNDPROC CSearchAppDlg::OldEditSizeProc = NULL;
+HWND CSearchAppDlg::m_hTaskWnd = NULL;
+HANDLE CSearchAppDlg::m_hSecondThread = NULL;
+BOOL CSearchAppDlg::m_bStopSearch = FALSE;
 
 void __stdcall OnDestroyItem(FILEITEM& Item)
 {
 	CoTaskMemFree(Item.wsFullName);
+}
+
+void __stdcall OnDestroyFilter(FILTER& filter)
+{
+	filter.pClassFactory->Release();
+	delete[] filter.wsExt;
+}
+
+void __stdcall OnDestroyFilterList(FILTERLIST& filterlist)
+{
+	filterlist.pFilterList->erase_all();
+	delete filterlist.pFilterList;
 }
 
 LRESULT CALLBACK CSearchAppDlg::NewEditSizeProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -47,7 +71,8 @@ LRESULT CALLBACK CSearchAppDlg::NewEditSizeProc(HWND hWnd, UINT uMsg, WPARAM wPa
 }
 
 CSearchAppDlg::CSearchAppDlg(void):
-m_FileItems(OnDestroyItem)
+m_FileItems(OnDestroyItem),
+m_FilterList(OnDestroyFilterList)
 {
 	m_hWnd = NULL;
 
@@ -62,14 +87,24 @@ FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_A
 	m_dSorted = SortedUnknown;
 	*m_wsDesktopPath = 0;
 
-	m_wsSearchIn = m_wsSearchFileName = m_wsSearchFileExt = NULL;
+	m_wsSearchIn = m_wsSearchFileName = m_wsSearchFileExt = m_wsSearchContents = NULL;
+	m_uRegisteredValue = 0;
+
+	WNDCLASS wndclass = {0};
+	wndclass.hInstance = hAppInstance;
+	wndclass.lpfnWndProc = SecondWndProc;
+	wndclass.lpszClassName = L"SecondWndClass";
+
+	RegisterClassW(&wndclass);
 }
 
 
 CSearchAppDlg::~CSearchAppDlg(void)
 {
-	if (m_wsSearchIn) delete[] m_wsSearchIn;
-	if (m_wsSearchFileName) delete[] m_wsSearchFileName;
+	if (m_wsSearchIn) {delete[] m_wsSearchIn; m_wsSearchIn = NULL;}
+	if (m_wsSearchFileName) {delete[] m_wsSearchFileName; m_wsSearchFileName = NULL;}
+	if (m_wsSearchContents) {delete[] m_wsSearchContents; m_wsSearchContents = NULL;}
+	m_FilterList.erase_all();
 }
 
 INT_PTR CALLBACK CSearchAppDlg::DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -89,10 +124,31 @@ INT_PTR CALLBACK CSearchAppDlg::DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, 
 	{
 		switch (uMsg)
 		{
+		case WM_SHELLNOTIFY:
+			{
+				pThis->OnShellNotify(wParam, lParam);
+			}
+			break;
+
 		case WM_HELP:
 			{
-				CAboutDlg aboutDlg;
-				aboutDlg.DoModal(hDlg);
+				WCHAR wsHelp[MAX_PATH];
+				GetWindowsDirectory(wsHelp, MAX_PATH);
+				StringCchCatW(wsHelp, MAX_PATH, L"\\hh.exe");
+
+				DWORD len = MAX_PATH + 28;
+				WCHAR* wsDir = new WCHAR[len];
+				GetModuleFileNameW(0, wsDir, len);
+				WCHAR* wpos= wcsrchr(wsDir, '\\');
+				if (wpos)
+				{
+					*wpos = 0;
+				}
+
+				StringCchCatW(wsDir, len, L"\\SearchApp Documentation.chm");
+
+				ShellExecute(hDlg, L"open", wsHelp, wsDir, 0, 1);
+				delete[] wsDir;
 			}
 			break;
 
@@ -175,7 +231,12 @@ INT_PTR CALLBACK CSearchAppDlg::DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, 
 						{
 							FILEITEM* pItem = &pThis->m_FileItems[pItemAct->iItem];
 							*(--pItem->wsDisplayName) = '\\';
-							ShellExecute(hDlg, NULL, pItem->wsFullName, NULL, NULL, SW_SHOWDEFAULT);
+							if (!pThis->PathFileExistsEx(pItem->wsFullName))
+							{
+								MessageBox(hDlg, L"This item does not exist - it has been deleted or moved.", 0, 0);
+							}
+							else
+								ShellExecute(hDlg, NULL, pItem->wsFullName, NULL, NULL, SW_SHOWDEFAULT);
 							*pItem->wsDisplayName = 0;
 							++pItem->wsDisplayName;
 						}
@@ -191,6 +252,16 @@ INT_PTR CALLBACK CSearchAppDlg::DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, 
 							pThis->OnListItemContextMenu(pItemAct->iItem, pItemAct->ptAction);
 					}
 					break;
+
+				case NM_CLICK:
+					{
+						if (pNMHDR->idFrom == IDCL_ABOUT)
+						{
+							CAboutDlg dlg;
+							dlg.DoModal(hDlg);
+						}
+					}
+					break;
 				}
 			}
 			break;
@@ -203,7 +274,76 @@ INT_PTR CALLBACK CSearchAppDlg::DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, 
 				break;
 
 			case IDC_BROWSE:
-				MessageBox(hDlg, L"Unfortunately for you, BROWSE button IS NOT YET IMPELEMENTED!!!", L"INFIDEL!!!", 0);
+				{
+					IFileOpenDialog* pOpen;
+					HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL, IID_IFileOpenDialog, (void**)&pOpen);
+					if (FAILED(hr))
+					{
+						MessageBox(hDlg, L"Could not create the open dialog", 0, 0);
+						break;
+					}
+
+					ITEMIDLIST* pidlDesktop;
+					hr = SHGetKnownFolderIDList(FOLDERID_Desktop, 0, 0, &pidlDesktop);
+					if (FAILED(hr))
+					{
+						pOpen->Release();
+
+						MessageBox(hDlg, L"Could not create the open dialog", 0, 0);
+						break;
+					}
+
+					IShellItem* pDesktopItem;
+					hr = SHCreateItemFromIDList(pidlDesktop, IID_IShellItem, (void**)&pDesktopItem);
+					if (FAILED(hr))
+					{
+						CoTaskMemFree(pidlDesktop);
+						pOpen->Release();
+
+						MessageBox(hDlg, L"Could not create the open dialog", 0, 0);
+						break;
+					}
+
+					CoTaskMemFree(pidlDesktop);
+			
+					pOpen->SetDefaultFolder(pDesktopItem);
+					pDesktopItem->Release();
+
+					pOpen->SetOptions(FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+					hr = pOpen->Show(hDlg);
+					if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED))
+					{
+						pOpen->Release();
+						break;
+					}
+
+					hr = pOpen->GetResult(&pDesktopItem);
+					if (FAILED(hr))
+					{
+						pOpen->Release();
+
+						MessageBox(hDlg, L"Could not create the open dialog", 0, 0);
+						break;
+					}
+
+					WCHAR* wsPath;
+					hr = pDesktopItem->GetDisplayName(SIGDN_FILESYSPATH, &wsPath);
+					if (FAILED(hr))
+					{
+						pOpen->Release();
+						pDesktopItem->Release();
+
+						MessageBox(hDlg, L"Could not create the open dialog", 0, 0);
+						break;
+					}
+
+					SetDlgItemTextW(hDlg, IDC_EDIT_SEARCHIN, wsPath);
+					CoTaskMemFree(wsPath);
+
+					pDesktopItem->Release();
+					pOpen->Release();
+
+				}
 				break;
 
 			case IDC_MORE_OPTIONS:
@@ -233,6 +373,10 @@ INT_PTR CALLBACK CSearchAppDlg::DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, 
 
 		case WM_DESTROY:
 			{
+				if (pThis->m_uRegisteredValue)
+				{
+					SHChangeNotifyDeregister(pThis->m_uRegisteredValue);
+				}
 			}
 			break;
 
@@ -278,6 +422,13 @@ LRESULT CALLBACK CSearchAppDlg::MessageFilter(int nCode, WPARAM wParam, LPARAM l
 	{
 		MSG* pMsg = (MSG*)lParam;
 		if (pMsg->message == WM_KEYDOWN)
+
+			if (pMsg->hwnd == GetDlgItem(hMainDlg, IDC_EDIT_SEARCHIN) && pMsg->wParam == VK_RETURN)
+			{
+				HWND hOld = SetFocus(hMainDlg);
+				SetFocus(hOld);
+			}
+
 			if (pMsg->hwnd == GetDlgItem(hMainDlg, IDC_EDIT_SEARCH_FILENAME))
 			{
 				//THE USER HAS PRESSED ENTER IN THE SEARCH FILENAME EDITBOX
@@ -407,7 +558,8 @@ end:
 }
 
 BOOL CSearchAppDlg::OnInitDialog(void)
-{
+{ 
+	LoadFilters();
 	//the menu:
 	{
 		HMENU hMenu = GetSystemMenu(m_hWnd, FALSE);
@@ -429,9 +581,9 @@ BOOL CSearchAppDlg::OnInitDialog(void)
 	SendMessage(GetDlgItem(m_hWnd, IDC_ON_HIDDEN), BM_SETCHECK, m_Condition.dwAttribON & FILE_ATTRIBUTE_HIDDEN, 0);
 	SendMessage(GetDlgItem(m_hWnd, IDC_OFF_HIDDEN), BM_SETCHECK, m_Condition.dwAttribOFF & FILE_ATTRIBUTE_HIDDEN, 0);
 
-	HICON hIcon = LoadIcon(hAppInstance, MAKEINTRESOURCE(IDR_MAINFRAME));
-	SendMessage(m_hWnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
-	SendMessage(m_hWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+	m_hIcon = LoadIcon(hAppInstance, MAKEINTRESOURCE(IDR_MAINFRAME));
+	SendMessage(m_hWnd, WM_SETICON, ICON_BIG, (LPARAM)m_hIcon);
+	SendMessage(m_hWnd, WM_SETICON, ICON_SMALL, (LPARAM)m_hIcon);
 
 	hHookMsg = SetWindowsHookEx(WH_MSGFILTER, MessageFilter, 0, GetCurrentThreadId());
 
@@ -439,10 +591,13 @@ BOOL CSearchAppDlg::OnInitDialog(void)
 	m_hListCtrl = GetDlgItem(m_hWnd, IDC_LIST_ITEMSVIEW);
 	m_hSearchFileName = GetDlgItem(m_hWnd, IDC_EDIT_SEARCH_FILENAME);
 	m_hSearchIn = GetDlgItem(m_hWnd, IDC_EDIT_SEARCHIN);
+	m_hSearchContents = GetDlgItem(m_hWnd, IDC_EDIT_CONTAININGTEXT);
 	m_hBrowse = GetDlgItem(m_hWnd, IDC_BROWSE);
 	//size:
 	m_hSizeMin = GetDlgItem(m_hWnd, IDC_SIZE_MIN);
 	m_hSizeMax = GetDlgItem(m_hWnd, IDC_SIZE_MAX);
+
+	SHAutoComplete(m_hSearchIn, SHACF_AUTOSUGGEST_FORCE_ON | SHACF_FILESYS_ONLY);
 
 	InitializeSizeBoxes();
 	OldEditSizeProc = (WNDPROC)SetWindowLongW(m_hSizeMin, GWL_WNDPROC, (LONG)NewEditSizeProc);
@@ -470,6 +625,20 @@ BOOL CSearchAppDlg::OnInitDialog(void)
 			MessageBox(0, L"Could not read the registry value", 0, 0);
 			goto after_block;
 		}
+
+		//creating our temporary directory and store its full name
+		cbData = MAX_PATH * 2;
+		StringCchCopyW(m_wsTempFolder, 288, L"\\\\?\\");
+		dwError = RegGetValueW(hKey, L"Volatile Environment", L"LOCALAPPDATA", RRF_RT_REG_SZ, NULL, (void*)(m_wsTempFolder + 4), &cbData);
+		if (dwError != ERROR_SUCCESS)
+		{
+			MessageBox(0, L"Could not read the registry value", 0, 0);
+			goto after_block;
+		}
+		StringCchCatW(m_wsTempFolder, 288, L"\\Temp\\_SearchApp_Zenith_");
+		m_nTempFolderLen = wcslen(m_wsTempFolder);
+		CreateDirectoryW(m_wsTempFolder, NULL);
+
 		RegCloseKey(hKey);
 
 		StringCchCatW(m_wsDesktopPath, MAX_PATH, L"\\Desktop");
@@ -523,8 +692,6 @@ after_block:
 	lvcolumn.pszText = L"Type";
 	SendMessage(m_hListCtrl, LVM_INSERTCOLUMN, 3, (LPARAM)&lvcolumn);
 
-//	SetFocus(m_hSearchIn);
-
 	//NU MERE BINE: TRE SA GASESC ALTA VARIANTA SA GASEASCA TOP-LEVEL FOLDER WINDOW!!!
 	if (hDesktop && !IsIconic(hDesktop))
 	{
@@ -537,8 +704,7 @@ after_block:
 		//now, the text itself
 		WCHAR* wstr;
 		wstr = new WCHAR[len];
-		SendMessage(hWndFound, WM_GETTEXT, MAX_PATH, (LPARAM)wstr);
-		//we use a CString, for deleting easier.
+		SendMessageW(hWndFound, WM_GETTEXT, len, (LPARAM)wstr);
 
 		WCHAR* wsAddress = wstr + 5;
 		*wsAddress = '\\';
@@ -547,7 +713,7 @@ after_block:
 		*(wsAddress + 3) = '\\';
 
 		//now sAddress has the exact Path. We must make sure that sAddress is a FileSystem path.
-		if (PathFileExistsEx(wsAddress))
+		if (PathFileExistsEx(wsAddress, TRUE))
 		{
 			SetWindowText(m_hSearchIn, wsAddress + 4);
 			delete[] wstr;
@@ -572,7 +738,7 @@ after_block:
 		//close the clipboard
 		CloseClipboard();
 		
-		if (!PathFileExistsEx(wsClipBoard)) {delete[] wsClipBoard; return 0;}
+		if (!PathFileExistsEx(wsClipBoard, TRUE)) {delete[] wsClipBoard; return 0;}
 		SetWindowText(m_hSearchIn, wsClipBoard + 4);
 		delete[] wsClipBoard;
 	}
@@ -644,17 +810,126 @@ void CSearchAppDlg::OnSize(UINT nType, WORD cx, WORD cy)
 }
 
 
-inline bool CSearchAppDlg::PathFileExistsEx(const WCHAR* wsPath)
+inline bool CSearchAppDlg::PathFileExistsEx(const WCHAR* wsPath, BOOL bMustBeDir)
 {
-	WIN32_FIND_DATA data;
+	/*WIN32_FIND_DATA data;
 	HANDLE hFind = FindFirstFile(wsPath, &data);
 	if (INVALID_HANDLE_VALUE == hFind)
 	{
 		return false;
 	}
 
+	if (bMustBeDir && !(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || data.dwFileAttributes & FILE_ATTRIBUTE_DEVICE))
+		return false;
+
 	FindClose(hFind);
+	return true;*/
+
+	/*HANDLE hFile = CreateFileW(wsPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, 0);
+	if (INVALID_HANDLE_VALUE == hFile)
+	{
+		return false;
+	}*/
+
+	DWORD dwAttr = GetFileAttributes(wsPath);
+
+	if (dwAttr == INVALID_FILE_ATTRIBUTES) return false;
+
+	if (bMustBeDir && !(dwAttr & FILE_ATTRIBUTE_DIRECTORY || dwAttr & FILE_ATTRIBUTE_DEVICE))
+		return false;
+
+	//CloseHandle(hFile);
 	return true;
+}
+
+LRESULT CALLBACK CSearchAppDlg::SecondWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	switch (uMsg)
+	{
+	case WM_TARYICON_DESTROY:
+		{
+			NOTIFYICONDATA nid = {0};
+
+			nid.cbSize = sizeof(nid);
+			nid.hWnd = m_hTaskWnd;
+			nid.uID = SEARCH_TASK_ICON;
+			Shell_NotifyIconW(NIM_DELETE, &nid);
+
+			DestroyWindow(m_hTaskWnd);
+			m_hTaskWnd = NULL;
+		}
+		break;
+
+	case WM_TRAYICONMSG:
+		{
+			if (lParam == WM_RBUTTONUP)
+			{
+				HMENU hMenu = CreatePopupMenu();
+
+#define ID_STOPSEARCH 1
+
+				AppendMenuW(hMenu, MF_STRING, ID_STOPSEARCH, L"Stop searching");
+
+				POINT pt = {0};
+				GetCursorPos(&pt);
+
+				BOOL bResult = TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY | TPM_RETURNCMD | TPM_LEFTBUTTON,
+					pt.x, pt.y, 0, m_hTaskWnd, NULL);
+
+				if (bResult == ID_STOPSEARCH)
+				{
+					m_bStopSearch = TRUE;
+				}
+			}
+		}
+		break;
+	}
+
+	return DefWindowProc(hWnd, uMsg, wParam, lParam);
+}
+
+DWORD WINAPI CSearchAppDlg::SecondThread(CSearchAppDlg* pDlg)
+{
+	//creating the window that receives the notifications
+	m_hTaskWnd = CreateWindowW(L"SecondWndClass", 0, 0, 0, 0, 10, 10, 0, 0, hAppInstance, 0);
+	if (m_hTaskWnd)
+	{
+		WCHAR* wsFolderName = wcsrchr(pDlg->m_wsSearchIn, '\\');
+		if (wsFolderName == 0) wsFolderName = pDlg->m_wsSearchIn;
+		else wsFolderName++;
+
+		NOTIFYICONDATA nid = {0};
+		nid.cbSize = sizeof(nid);
+		nid.hWnd = m_hTaskWnd;
+		nid.uID = SEARCH_TASK_ICON;
+		nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+		nid.hIcon = pDlg->m_hIcon;
+		nid.uCallbackMessage = WM_TRAYICONMSG;
+		StringCchPrintfW(nid.szTip, 128, L"Searching for \"%s\" in \"%s\"", pDlg->m_wsSearchFileName, wsFolderName);
+		Shell_NotifyIconW(NIM_ADD, &nid);
+
+		MSG msg = {0};
+		int nResult;
+		do
+		{ 
+			nResult = PeekMessageW(&msg, m_hTaskWnd, 0, 0, TRUE);
+			if (nResult)
+			{
+				TranslateMessage(&msg);
+				DispatchMessage(&msg);
+			}
+			else
+			{
+				if (!m_hTaskWnd) break;
+				Sleep(50);
+			}
+		} 
+		while(msg.message != WM_DESTROY);
+	}
+
+	CloseHandle(GetCurrentThread());
+
+	return 0;
 }
 
 inline void CSearchAppDlg::OnSearch()
@@ -712,6 +987,7 @@ inline void CSearchAppDlg::OnSearch()
 
 	if (m_wsSearchIn) {delete[] m_wsSearchIn; m_wsSearchIn = NULL;}
 	if (m_wsSearchFileName) {delete[] m_wsSearchFileName; m_wsSearchFileName = NULL;}
+	if (m_wsSearchContents) {delete[] m_wsSearchContents; m_wsSearchContents = NULL;}
 
 #ifdef TESTING
 	//performance checking only!
@@ -737,6 +1013,19 @@ inline void CSearchAppDlg::OnSearch()
 		nTextLen++;
 		m_wsSearchIn = new WCHAR[nTextLen];
 		GetWindowText(m_hSearchIn, m_wsSearchIn, nTextLen);
+
+		if (*(m_wsSearchIn + nTextLen - 2) == '\\')
+		{
+			*(m_wsSearchIn + nTextLen - 2) = 0;
+		}
+
+		if (false == PathFileExistsEx(m_wsSearchIn))
+		{
+			MessageBox(m_hWnd, L"The path provided does not exist!", L"Improper search request!", MB_ICONWARNING);
+			delete[] m_wsSearchIn;
+			m_wsSearchIn = NULL;
+			return;
+		}
 	}
 	
 	nTextLen = GetWindowTextLength(m_hSearchFileName);
@@ -745,6 +1034,32 @@ inline void CSearchAppDlg::OnSearch()
 		nTextLen++;
 		m_wsSearchFileName = new WCHAR[nTextLen];
 		GetWindowText(m_hSearchFileName, m_wsSearchFileName, nTextLen);
+	}
+
+	//the search contents:
+	nTextLen = GetWindowTextLength(m_hSearchContents);
+	if (nTextLen)
+	{
+		nTextLen++;
+		m_wsSearchContents = new WCHAR[nTextLen];
+		GetWindowText(m_hSearchContents, m_wsSearchContents, nTextLen);
+
+		//check FILES and uncheck FOLDERS:
+		SendMessage(GetDlgItem(m_hWnd, IDC_ON_DIRECTORIES), BM_SETCHECK, 0, 0);
+		SendMessage(GetDlgItem(m_hWnd, IDC_OFF_DIRECTORIES), BM_SETCHECK, 1, 0);
+
+		CharCheckEnc = 0;
+		if (m_Condition.m_bCSContents)
+		{
+			CharCheckEnc = CheckCharEncCS;
+			SearchUsingFilter = SearchUsingFilterCS;
+		}
+
+		else
+		{
+			CharCheckEnc = CheckCharEnc;
+			SearchUsingFilter = SearchUsingFilterNCS;
+		}
 	}
 
 #ifdef TESTING
@@ -763,21 +1078,18 @@ inline void CSearchAppDlg::OnSearch()
 	//if not case sensitive, we make lower the search filename.
 	if (!m_wsSearchFileName)
 	{
-		MessageBox(m_hWnd, L"You must type something to search", L"INFIDEL SCUM!", 0);
-		return;
-	}
-
-	if (!m_wsSearchFileName)
-	{
-		MessageBox(m_hWnd, L"You must type a path to search. Unfortunately for you, BROWSE button IS NOT YET IMPELEMENTED!!!", L"INFIDEL!!!", 0);
+		MessageBox(m_hWnd, L"You must type something to search", L"Improper search request!", MB_ICONWARNING);
 		return;
 	}
 
 	//for faster search, hide the window!
 	ShowWindow(m_hWnd, 0);
+	m_bStopSearch = FALSE;
+
+	m_hSecondThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)SecondThread, (void*)this, 0, 0);
 
 #pragma warning (suppress: 4996)
-	if (!m_Condition.m_bCSFileName) _wcslwr(m_wsSearchFileName); //MUST BE MODIFIED!!
+	if (!m_Condition.m_bCSFileName) _wcslwr(m_wsSearchFileName); 
 	GetFileExt(m_wsSearchFileName, &m_wsSearchFileExt, FALSE);
 
 	//getting to the folder
@@ -814,7 +1126,6 @@ inline void CSearchAppDlg::OnSearch()
 	}
 
 	pDesktopFolder->Release();
-	CoTaskMemFree(pidlFolder);
 
 	UpdateCondition();
 	//retrieving the enumflags:
@@ -824,6 +1135,12 @@ inline void CSearchAppDlg::OnSearch()
 	if (m_Condition.dwAttribON & FILE_ATTRIBUTE_HIDDEN)
 		m_ulEnumFlags |= SHCONTF_INCLUDEHIDDEN;
 
+	if (m_uRegisteredValue)
+	{
+		SHChangeNotifyDeregister(m_uRegisteredValue);
+		m_uRegisteredValue = 0;
+	}
+
 	//the actual search
 	SearchFolder(pSearchFolder);
 
@@ -831,7 +1148,13 @@ inline void CSearchAppDlg::OnSearch()
 
 	//after the searching is finish, show the dialogbox:
 	ShowWindow(m_hWnd, 1);
+	SendMessage(m_hTaskWnd, WM_TARYICON_DESTROY, 0, 0);
+	m_bStopSearch = FALSE;
+
 	m_dSorted = SortedUnknown;
+
+	WatchFolder(pidlFolder);
+	CoTaskMemFree(pidlFolder);
 
 #ifdef TESTING
 	QueryPerformanceCounter(&liSecond);
@@ -872,7 +1195,7 @@ void CSearchAppDlg::SearchFolder(IShellFolder* pSearchFolder)
 			return;
 		}
 
-		if (S_FALSE == hrEnum) break;
+		if (S_FALSE == hrEnum || m_bStopSearch) break;
 
 		//we need to know whether this is a folder or a file, and if it is a system item
 		ULONG ulFlags = 0xFFFFFFFF;
@@ -977,6 +1300,28 @@ void CSearchAppDlg::CheckItem(IShellFolder* pSearchFolder, ITEMIDLIST* pidlChild
 		return;
 	}
 
+	if (m_wsSearchContents)
+	{
+		//if the size of the file is 0 (zero), it is NOT a result.
+		if (data.nFileSizeLow == 0 && data.nFileSizeHigh == 0)
+		{
+			delete[] wsFileName;
+			CoTaskMemFree(wsFullName);
+			return;
+		}
+
+		else if (false == CheckFileContents(wsFileName, wsFileExt, data))
+		{
+			delete[] wsFileName;
+			CoTaskMemFree(wsFullName);
+			return;
+		}
+		//else it is good
+	}
+
+	delete[] wsFileName;
+
+	//ADDING THE ITEM
 	IShellFolder* pDesktopFolder;
 	HRESULT hr = SHGetDesktopFolder(&pDesktopFolder);
 	if (FAILED(hr))
@@ -993,6 +1338,7 @@ void CSearchAppDlg::CheckItem(IShellFolder* pSearchFolder, ITEMIDLIST* pidlChild
 	{
 		_ASSERT(0);
 		MessageBox(0, L"Could not receive parse item display name during search", 0, 0);
+		pDesktopFolder->Release();
 		CoTaskMemFree(wsFullName);
 		return;
 	}
@@ -1005,7 +1351,6 @@ void CSearchAppDlg::CheckItem(IShellFolder* pSearchFolder, ITEMIDLIST* pidlChild
 	if (false == dwResult)
 	{
 		DisplayError();
-		delete[] wsFileName;
 		CoTaskMemFree(wsFullName);
 		return;
 	}
@@ -1014,7 +1359,7 @@ void CSearchAppDlg::CheckItem(IShellFolder* pSearchFolder, ITEMIDLIST* pidlChild
 
 	//ADDING THE ITEM TO THE FILEITEM DEQUE
 	FILEITEM fileitem;
-	//fileitem.wsFileName
+	//fileitem.wsFullName
 	fileitem.wsFullName = wsFullName;
 	//fileitem.wsDisplayName
 	fileitem.wsDisplayName = fileitem.wsFullName + (wsDisplayName - wsFullName);
@@ -1050,7 +1395,6 @@ void CSearchAppDlg::CheckItem(IShellFolder* pSearchFolder, ITEMIDLIST* pidlChild
 	if (m_bSearchFast)
 	{
 		m_nCurrentItem++;
-		delete[] wsFileName;
 		return;
 	}
 
@@ -1068,7 +1412,6 @@ SystemTime.wHour, SystemTime.wMinute);
 	{
 		ListView_SetItemText(m_hListCtrl, m_nCurrentItem, 3, L"folder");
 		m_nCurrentItem++;
-		delete[] wsFileName;
 		return;
 	}
 
@@ -1076,7 +1419,6 @@ SystemTime.wHour, SystemTime.wMinute);
 	ListView_SetItemText(m_hListCtrl, m_nCurrentItem, 3, wsFileExt);
 
 	m_nCurrentItem++;
-	delete[] wsFileName;
 }
 
 inline BOOL CSearchAppDlg::CheckFlags(const ULONG& ulFlags)
@@ -1109,7 +1451,7 @@ inline BOOL CSearchAppDlg::CheckFlags(const ULONG& ulFlags)
 	return true;
 }
 
-bool CSearchAppDlg::CheckAttributes(const WIN32_FILE_ATTRIBUTE_DATA& data)
+BOOL CSearchAppDlg::CheckAttributes(const WIN32_FILE_ATTRIBUTE_DATA& data)
 {
 	//NOW, WE CHECK SIZE & TIME.
 	if (m_Condition.Size)
@@ -1682,6 +2024,12 @@ void CSearchAppDlg::OnListItemContextMenu(int nItem, POINT& ptAction)
 {
 	//get the item by its ID
 	FILEITEM curItem = m_FileItems[nItem];
+	*(curItem.wsDisplayName - 1) = '\\';
+	if (!PathFileExistsEx(curItem.wsFullName))
+	{
+		MessageBox(m_hWnd, L"This item does not exist - it has been deleted or moved.", 0, 0);
+	}
+	*(curItem.wsDisplayName - 1) = '\0';
 	
 	//GETTING THE PIDL AND ISHELLFOLDER OF THE CURRENT FOLDER
 	IShellFolder* pDesktopFolder, *pCurrentFolder;
@@ -1696,7 +2044,7 @@ void CSearchAppDlg::OnListItemContextMenu(int nItem, POINT& ptAction)
 	pDesktopFolder->ParseDisplayName(m_hWnd, NULL, curItem.wsFullName, NULL, &pidlCurItem, NULL);
 	pidlChildItem = ILFindLastID(pidlCurItem);
 
-	//GETTING A LIST (DEQUE) OF THE SELECTED ITEMS
+	//GETTING A LIST OF THE SELECTED ITEMS
 	int nNrSel = SendMessage(m_hListCtrl, LVM_GETSELECTEDCOUNT, 0, 0);
 	CDoubleList<ITEM> Items(NULL);
 	int nSize;
@@ -2005,26 +2353,6 @@ void CSearchAppDlg::OnDeleteItems(ITEMIDLIST** pidlChildren, int nSize)
 		{
 			MessageBox(0, L"could not perform operations. Re-searching data", 0, 0);
 			OnSearch();
-		}
-	}
-	else
-	{
-		//operation successful. delete items from deque and listctrl.
-		int nCurSel = SendMessage(m_hListCtrl, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
-
-		CDoubleList<FILEITEM>::Iterator I;
-		while (nCurSel != -1)
-		{
-			//getting each item bt ID
-			if (TRUE == SendMessage(m_hListCtrl, LVM_DELETEITEM, nCurSel, 0))
-			{
-				I = m_FileItems.GetAt(nCurSel);
-				m_FileItems.erase(I);
-
-				nCurSel--;
-			}
-
-			nCurSel = SendMessage(m_hListCtrl, LVM_GETNEXTITEM, (WPARAM)nCurSel, LVNI_SELECTED);
 		}
 	}
 
@@ -2338,7 +2666,7 @@ void CSearchAppDlg::FilterSelectedItems(IShellFolder* pDesktopFolder, CDoubleLis
 
 	//creating the PIDLs
 	nSize = Items->size();
-	ITEMIDLIST** pidlChildren;
+	ITEMIDLIST** pidlChildren = NULL;
 	if (Children)
 	{
 		pidlChildren = new ITEMIDLIST*[nSize];
@@ -2355,13 +2683,6 @@ void CSearchAppDlg::FilterSelectedItems(IShellFolder* pDesktopFolder, CDoubleLis
 		*(I->m_Value.wsDisplayName - 1) = '\0';
 	}
 
-	/*if (Children == 0)
-	{
-		for (int i = 0; i < nSize; i++)
-			CoTaskMemFree(pidlChildren[i]);
-		delete[] pidlChildren;
-	}
-	else*/
 	if (Children)
 	{
 		*Children = pidlChildren;
@@ -2478,26 +2799,6 @@ void CSearchAppDlg::OnPermanentDeleteItems(ITEMIDLIST** pidlChildren, int nSize)
 		{
 			MessageBox(0, L"could not perform operations. Re-searching data", 0, 0);
 			OnSearch();
-		}
-	}
-	else
-	{
-		//operation successful. delete items from deque and listctrl.
-		int nCurSel = SendMessage(m_hListCtrl, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
-
-		CDoubleList<FILEITEM>::Iterator I;
-		while (nCurSel != -1)
-		{
-			//getting each item bt ID
-			if (TRUE == SendMessage(m_hListCtrl, LVM_DELETEITEM, nCurSel, 0))
-			{
-				I = m_FileItems.GetAt(nCurSel);
-				m_FileItems.erase(I);
-
-				nCurSel--;
-			}
-
-			nCurSel = SendMessage(m_hListCtrl, LVM_GETNEXTITEM, (WPARAM)nCurSel, LVNI_SELECTED);
 		}
 	}
 
@@ -2651,7 +2952,7 @@ void CSearchAppDlg::InitializeSizeBoxes(void)
 		//MAX
 		if (*(m_Condition.Size + 1) == 0)
 		{
-			SetWindowTextW(m_hSizeMax, L"Anytime");
+			SetWindowTextW(m_hSizeMax, L"Any");
 		}
 		else
 		{
@@ -2907,7 +3208,7 @@ BOOL CSearchAppDlg::GetNextStringToSize(WCHAR*& wPos, KEYSIZE& key)
 
 	if (lastvalid > -1)
 	{
-		if (i < wcslen(*(wsKeys + lastvalid))) *(checked + lastvalid) = - 1;
+		if (i < (int)wcslen(*(wsKeys + lastvalid))) *(checked + lastvalid) = - 1;
 		if (*(checked + lastvalid) == - 1) lastvalid = 500;
 	}
 
@@ -2917,4 +3218,1729 @@ BOOL CSearchAppDlg::GetNextStringToSize(WCHAR*& wPos, KEYSIZE& key)
 	else return false;
 
 	return true;
+}
+
+void CSearchAppDlg::WatchFolder(ITEMIDLIST* pidlFolder)
+{
+	SHChangeNotifyEntry entries[1] = {pidlFolder, TRUE};
+	//perhaps I should remove shell level
+	m_uRegisteredValue = SHChangeNotifyRegister(m_hWnd, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+SHCNE_ATTRIBUTES | SHCNE_DELETE | SHCNE_RMDIR | SHCNE_RENAMEFOLDER | SHCNE_RENAMEITEM,
+WM_SHELLNOTIFY, ARRAYSIZE(entries), entries);
+
+	if (false == m_uRegisteredValue)
+	{
+		MessageBox(m_hWnd, L"Could not register shell notification", 0, 0);
+		return;
+	}
+}
+
+void CSearchAppDlg::OnShellNotify(WPARAM wParam, LPARAM lParam)
+{
+	PIDLIST_ABSOLUTE* pidlList;
+	LONG lEvent;
+	HANDLE hLock = SHChangeNotification_Lock((HANDLE)wParam, (DWORD)lParam, &pidlList, &lEvent);
+	if (hLock)
+	{
+		WCHAR* wsName1 = NULL, *wsName2 = NULL;
+		if (pidlList[0])
+		{
+			IShellItem* pShellItem;
+			HRESULT hr = SHCreateItemFromIDList(pidlList[0], IID_IShellItem, (void**)&pShellItem);
+			hr = pShellItem->GetDisplayName(SIGDN_FILESYSPATH, &wsName1);
+			pShellItem->Release();
+		}
+
+		if (pidlList[1])
+		{
+			IShellItem* pShellItem;
+			HRESULT hr = SHCreateItemFromIDList(pidlList[1], IID_IShellItem, (void**)&pShellItem);
+			hr = pShellItem->GetDisplayName(SIGDN_FILESYSPATH, &wsName2);
+			pShellItem->Release();
+		}
+
+		switch (lEvent)
+		{
+			//file deleted
+		case SHCNE_DELETE:
+			{
+				OnNotifyDeleteFile(wsName1);
+			}
+			break;
+
+			//folder deleted
+		case SHCNE_RMDIR:
+			{
+				OnNotifyDeleteFolder(wsName1);
+			}
+			break;
+
+			//file renamed
+		case SHCNE_RENAMEITEM:
+			{
+				OnNotifyRenameFile(wsName1, wsName2);
+			}
+			break;
+
+			//folder renamed
+		case SHCNE_RENAMEFOLDER:
+			{
+				OnNotifyRenameFolder(wsName1, wsName2);
+			}
+			break;
+		}
+
+		if (wsName1)
+			CoTaskMemFree(wsName1);
+		if (wsName2)
+			CoTaskMemFree(wsName2);
+
+		SHChangeNotification_Unlock(hLock);
+	}
+}
+
+//file deleted
+void CSearchAppDlg::OnNotifyDeleteFile(WCHAR* wsFileName)
+{
+	//seek the filename in the list
+	CDoubleList<FILEITEM>::Iterator I;
+	
+	int i = 0;
+	for (I = m_FileItems.begin(); I != NULL; I = I->pNext, i++)
+	{
+		*(I->m_Value.wsDisplayName-1) = '\\';
+		if (_wcsicmp(I->m_Value.wsFullName, wsFileName) == 0)
+		{
+			//remove from the list
+			if (TRUE == SendMessage(m_hListCtrl, LVM_DELETEITEM, i, 0))
+			{
+				m_FileItems.erase(I);
+				break;
+			}
+		}
+		*(I->m_Value.wsDisplayName-1) = '\0';
+	}
+}
+
+//folder deleted
+void CSearchAppDlg::OnNotifyDeleteFolder(WCHAR* wsFolderName)
+{
+	//seek the filename in the list
+	CDoubleList<FILEITEM>::Iterator I;
+	WCHAR* wsFolder = NULL;
+	
+	int i = 0;
+	for (I = m_FileItems.begin(); I != NULL; I = I->pNext, i++)
+	{
+		*(I->m_Value.wsDisplayName-1) = '\\';
+		if (_wcsicmp(I->m_Value.wsFullName, wsFolderName) == 0)
+		{
+			int len = wcslen(I->m_Value.wsFullName) + 1;
+			wsFolder = new WCHAR[len];
+			StringCchCopyW(wsFolder, len, I->m_Value.wsFullName);
+			//I->m_Value.wsFullName is the folder!!
+			//remove from the list
+			if (TRUE == SendMessage(m_hListCtrl, LVM_DELETEITEM, i, 0))
+			{
+				m_FileItems.erase(I);
+				break;
+			}
+		}
+		*(I->m_Value.wsDisplayName-1) = '\0';
+	}
+
+	if (wsFolder)
+	{
+		i = 0;
+		for (I = m_FileItems.begin(); I != NULL;)
+		{
+			*(I->m_Value.wsDisplayName-1) = '\\';
+			if (wcsstr(I->m_Value.wsFullName, wsFolder))
+			{
+				//remove from the list
+				if (TRUE == SendMessage(m_hListCtrl, LVM_DELETEITEM, i, 0))
+				{
+					m_FileItems.erase(I);
+				}
+			}
+			else
+			{
+				*(I->m_Value.wsDisplayName-1) = '\0';
+				I = I->pNext;
+				i++;
+			}
+		}
+
+		delete[] wsFolder;
+	}
+}
+	
+//file renamed
+void CSearchAppDlg::OnNotifyRenameFile(WCHAR* wsOldFileName, WCHAR* wsNewFileName)
+{
+	//seek the filename in the list
+	CDoubleList<FILEITEM>::Iterator I;
+	
+	int i = 0;
+	for (I = m_FileItems.begin(); I != NULL; I = I->pNext, i++)
+	{
+		*(I->m_Value.wsDisplayName-1) = '\\';
+		if (_wcsicmp(I->m_Value.wsFullName, wsOldFileName) == 0)
+		{
+			//rename:
+			CoTaskMemFree(I->m_Value.wsFullName);
+			int len = (wcslen(wsNewFileName) + 1) * 2;
+			I->m_Value.wsFullName = (WCHAR*)CoTaskMemAlloc(len);
+			StringCchCopyW(I->m_Value.wsFullName, len, wsNewFileName);
+			//retrieving the display name:
+			GetDisplayName(I->m_Value.wsFullName, &I->m_Value.wsDisplayName);
+			//retrieving the file extension:
+			GetFileExt(I->m_Value.wsDisplayName, &I->m_Value.wsExt, FALSE);
+			//setting the zero
+			*(I->m_Value.wsDisplayName - 1) = 0;
+
+			//setting the displayname:
+			ListView_SetItemText(m_hListCtrl, i, 0, I->m_Value.wsDisplayName);
+			break;
+		}
+		*(I->m_Value.wsDisplayName-1) = '\0';
+	}
+}
+
+//folder renamed
+void CSearchAppDlg::OnNotifyRenameFolder(WCHAR* wsOldFolderName, WCHAR* wsNewFolderName)
+{
+	//seek the filename in the list
+	CDoubleList<FILEITEM>::Iterator I;
+	WCHAR* wsFolder = NULL;
+	
+	int i = 0;
+	for (I = m_FileItems.begin(); I != NULL; I = I->pNext, i++)
+	{
+		*(I->m_Value.wsDisplayName-1) = '\\';
+		if (_wcsicmp(I->m_Value.wsFullName, wsOldFolderName) == 0)
+		{
+			//rename:
+			wsFolder = I->m_Value.wsFullName;
+			int len = (wcslen(wsNewFolderName) + 1) * 2;
+			I->m_Value.wsFullName = (WCHAR*)CoTaskMemAlloc(len);
+			StringCchCopyW(I->m_Value.wsFullName, len, wsNewFolderName);
+			//retrieving the display name:
+			GetDisplayName(I->m_Value.wsFullName, &I->m_Value.wsDisplayName);
+			//setting the zero
+			*(I->m_Value.wsDisplayName - 1) = 0;
+			//retrieving the file extension:
+			GetFileExt(I->m_Value.wsDisplayName, &I->m_Value.wsExt, FALSE);
+
+			//setting the displayname:
+			ListView_SetItemText(m_hListCtrl, i, 0, I->m_Value.wsDisplayName);
+			break;
+		}
+		*(I->m_Value.wsDisplayName-1) = '\0';
+	}
+
+	if (wsFolder)
+	{
+		i = 0;
+		for (I = m_FileItems.begin(); I != NULL; I = I->pNext, i++)
+		{
+			*(I->m_Value.wsDisplayName-1) = '\\';
+			WCHAR* wsResult = wcsstr(I->m_Value.wsFullName, wsFolder);
+			if (wsResult && *(I->m_Value.wsFullName + wcslen(wsFolder)) == '\\')
+			{
+				//rename:
+				//1. getting the display name:
+				int len = wcslen(I->m_Value.wsDisplayName) + 1;
+				WCHAR* wsDisplayName = new WCHAR[len];
+				StringCchCopyW(wsDisplayName, len, I->m_Value.wsDisplayName);
+				
+				//2. deleting old full display name
+				CoTaskMemFree(I->m_Value.wsFullName);
+
+				//3. allocating the new full display name
+				len = (wcslen(wsNewFolderName) + 1 + len) * 2;
+				I->m_Value.wsFullName = (WCHAR*)CoTaskMemAlloc(len);
+				//4. copying the folder's full name
+				StringCchCopyW(I->m_Value.wsFullName, len, wsNewFolderName);
+				//5. appending the '\\'
+				StringCchCatW(I->m_Value.wsFullName, len, L"\\");
+				//6. appending the display name
+				StringCchCatW(I->m_Value.wsFullName, len, wsDisplayName);
+				//7. deleting the unneeded display name
+				delete[] wsDisplayName;
+
+				//retrieving the display name:
+				GetDisplayName(I->m_Value.wsFullName, &I->m_Value.wsDisplayName);
+				//lowering the display name, if needed:
+				if (!m_Condition.m_bCSFileName)
+#pragma warning (suppress: 4996)
+					_wcslwr(I->m_Value.wsDisplayName);
+				//setting the '\0'
+				*(I->m_Value.wsDisplayName - 1) = 0;
+				//retrieving the file extension:
+				GetFileExt(I->m_Value.wsDisplayName, &I->m_Value.wsExt, FALSE);
+
+				//setting the displayname:
+				ListView_SetItemText(m_hListCtrl, i, 1, I->m_Value.wsFullName);
+			}
+			else
+			{
+				*(I->m_Value.wsDisplayName-1) = '\0';
+			}
+		}
+
+		CoTaskMemFree(wsFolder);
+	}
+}
+
+inline BOOL CSearchAppDlg::CheckFileContents(const WCHAR* wsFullName, const WCHAR* wsExtName, WIN32_FILE_ATTRIBUTE_DATA& data)
+{
+	IClassFactory* pClassFactory = FindFilter(wsExtName);
+	if (pClassFactory)
+		return SearchUsingFilter(wsFullName, m_wsSearchContents, pClassFactory, data);
+
+	HANDLE hFile = CreateFileW(wsFullName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, 0);
+	if (INVALID_HANDLE_VALUE == hFile) return FALSE;
+
+	BOOL bResult = FALSE;
+	LARGE_INTEGER liSize;
+	liSize.HighPart = data.nFileSizeHigh;
+	liSize.LowPart = data.nFileSizeLow;
+
+	bResult = CheckDefaultContents(hFile, liSize);
+
+	CloseHandle(hFile);
+	return bResult;
+}
+
+#define ENC_INVALID		0
+
+#define ENC_ASCII		1
+#define ENC_UTF16LE		2
+#define ENC_UTF16BE		4
+#define ENC_UTF8		8
+
+#define ENC_ALL			15 //ENC_ASCII | ENC_UTF16LE | ENC_UTF16BE | ENC_UTF8
+
+#define NRENC_ASCII			0
+#define NRENC_UTF16LE		1
+#define NRENC_UTF16BE		2
+#define NRENC_UTF8			3
+
+#define NR_ENCODINGS		4
+
+BOOL CSearchAppDlg::CheckDefaultContents(HANDLE hFile, LARGE_INTEGER& liSize)
+{
+	BYTE* Buffer;
+	DWORD dwRead;
+	int pointer = 0;
+	int length = wcslen(m_wsSearchContents);
+
+	DWORD dwLastEnc = ENC_ALL;
+
+	DWORD dwSzReq = /*100*/0x1400000;
+
+	//0x1400000 = 20 MB
+	if (liSize.QuadPart < dwSzReq)
+	{
+		Buffer = new BYTE[liSize.LowPart];
+		if (false == ReadFile(hFile, Buffer, liSize.LowPart, &dwRead, NULL))
+			return FALSE;
+
+		//checking each byte
+		DWORD dwEnc;
+		DWORD iFirstFound = (DWORD)-1;
+
+		int nr[NR_ENCODINGS] = {0, 0, 0, 0};
+		for (DWORD i = 0; i < dwRead; i++)
+		{
+			//retrieve the next char available encodings, and the number of character it needs for each encoding.
+			if (false == GetNextChar(Buffer + i, dwEnc, dwRead - i, nr))
+			{
+				pointer = 0;
+				dwLastEnc = ENC_ALL;
+				continue;
+			}
+
+			//if we found already elements within our search string of certain encodings, it must mach our current encoding
+			else if ((dwEnc = dwEnc & dwLastEnc) == 0)
+			{
+				if (pointer)
+				{
+					if (iFirstFound == (DWORD)-1)
+					{
+						i = 0;
+					}
+
+					else
+					{
+						i = iFirstFound;
+						iFirstFound = (DWORD)-1;
+					}
+				}
+
+				pointer = 0;
+				dwLastEnc = ENC_ALL;
+				continue;
+			}
+			
+			else
+			{
+				//we retrieve each char as its encodings and compare it to the current character in the search str.
+				//the encodings that fail will have the "nr" set to 0.
+				BOOL bResult = CharCheckEnc(Buffer + i, (BYTE*)(m_wsSearchContents + pointer), dwEnc, nr, (length - pointer) << 1);
+				if (false == bResult)
+				{
+					if (pointer)
+					{
+						if (iFirstFound == (DWORD)-1)
+						{
+							i = 0;
+						}
+
+						else
+						{
+							i = iFirstFound;
+							iFirstFound = (DWORD)-1;
+						}
+					}
+
+					pointer = 0;
+					dwLastEnc = ENC_ALL;
+				}
+				else
+				{
+					if (iFirstFound == (DWORD)-1)
+						iFirstFound = i;
+					pointer++;
+					//is this current wchar a surrogate?
+					if (bResult == 4) pointer++;
+
+					i += (--bResult);
+					dwLastEnc = dwEnc;
+
+					if (pointer == length)
+					{
+						delete[] Buffer;
+						return TRUE;
+					}
+				}
+			}
+		}
+		delete[] Buffer;
+	}
+
+	else
+	{
+		QWORD qwTotalRead = 0, qwSizeFileLeft = 0;
+		Buffer = new BYTE[dwSzReq];
+		BYTE* LastPart = NULL;
+		DWORD nLastPartSize = 0;
+		BOOL bRead = TRUE;
+		DWORD BeginI = 0;
+		while (bRead)
+		{
+			if (LastPart)
+			{
+				memcpy_s(Buffer, dwSzReq, LastPart, nLastPartSize);
+				delete[] LastPart;
+				LastPart = NULL;
+			}
+
+			bRead = ReadFile(hFile, Buffer + nLastPartSize, dwSzReq - nLastPartSize, &dwRead, NULL);
+			if (0 == dwRead) break;
+			if (false == bRead) break;
+			qwTotalRead += dwRead;
+			dwRead += nLastPartSize;
+
+			//checking each byte
+			DWORD dwEnc;
+			BOOL bNeedMore;
+			DWORD iFirstFound = (DWORD)-1;
+
+			int nr[NR_ENCODINGS] = {0, 0, 0, 0};
+			for (DWORD i = BeginI; i < dwRead; i++)
+			{
+				qwSizeFileLeft = liSize.QuadPart - qwTotalRead + dwRead - i;
+				//retrieve the next char available encodings, and the number of character it needs for each encoding.
+				if (false == GetNextChar(Buffer + i, dwEnc, dwRead - i, nr, bNeedMore, qwSizeFileLeft))
+				{
+					if (bNeedMore)
+					{
+						//a second buffer is needed to store the last part of the buffer (beggining with iFirstFound)
+						if (iFirstFound != (DWORD)-1)
+						{
+							nLastPartSize = dwRead - iFirstFound;
+							//BeginI = i - iFirstFound;
+
+							if (LastPart) delete[] LastPart;
+							LastPart = new BYTE[nLastPartSize];
+							memcpy_s(LastPart, nLastPartSize, Buffer + iFirstFound, nLastPartSize);
+						}
+
+						else
+						{
+							nLastPartSize = dwRead - i;
+							//BeginI = 0;
+
+							if (LastPart) delete[] LastPart;
+							LastPart = new BYTE[nLastPartSize];
+							memcpy_s(LastPart, nLastPartSize, Buffer + i, nLastPartSize);
+						}
+						//break;
+						pointer = 0;
+						dwLastEnc = ENC_ALL;
+						continue;
+					}
+
+					pointer = 0;
+					dwLastEnc = ENC_ALL;
+					continue;
+				}
+
+				//if we found already elements within our search string of certain encodings, it must mach our current encoding
+				else if ((dwEnc = dwEnc & dwLastEnc) == 0)
+				{
+					if (pointer)
+					{
+						if (iFirstFound == (DWORD)-1)
+						{
+							i = 0;
+						}
+
+						else
+						{
+							i = iFirstFound;
+							iFirstFound = (DWORD)-1;
+						}
+					}
+
+					pointer = 0;
+					dwLastEnc = ENC_ALL;
+					continue;
+				}
+				
+				else
+				{
+					//we retrieve each char as its encodings and compare it to the current character in the search str.
+					//the encodings that fail will have the "nr" set to 0.
+					BOOL bResult = CharCheckEnc(Buffer + i, (BYTE*)(m_wsSearchContents + pointer), dwEnc, nr, (length - pointer) << 1);
+					if (false == bResult)
+					{
+						if (pointer)
+						{
+							if (iFirstFound == (DWORD)-1)
+							{
+								i = 0;
+							}
+
+							else
+							{
+								i = iFirstFound;
+								iFirstFound = (DWORD)-1;
+							}
+						}
+
+						pointer = 0;
+						dwLastEnc = ENC_ALL;
+					}
+					else
+					{
+						if (iFirstFound == (DWORD)-1)
+							iFirstFound = i;
+						pointer++;
+						//is this current wchar a surrogate?
+						if (bResult == 4) pointer++;
+
+						i += (--bResult);
+						dwLastEnc = dwEnc;
+
+						if (pointer == length)
+						{
+							delete[] Buffer;
+							return TRUE;
+						}
+					}
+				}
+			}
+
+			if (!bNeedMore)
+			{
+				//a second buffer is needed to store the last part of the buffer (beggining with iFirstFound)
+				if (iFirstFound != (DWORD)-1)
+				{
+					nLastPartSize = dwRead - iFirstFound;
+					//BeginI = dwRead - iFirstFound;
+
+					if (LastPart) delete[] LastPart;
+					LastPart = new BYTE[nLastPartSize];
+					memcpy_s(LastPart, nLastPartSize, Buffer + iFirstFound, nLastPartSize);
+				}
+
+				else
+				{
+					nLastPartSize = 0;
+					//BeginI = 0;
+				}
+
+				pointer = 0;
+				dwLastEnc = ENC_ALL;
+			}
+		}
+		delete[] Buffer;
+		if (LastPart) delete[] LastPart;
+	}
+
+	return FALSE;
+}
+
+BOOL CSearchAppDlg::GetNextChar(const BYTE* wPos, DWORD& dwEnc, DWORD nMax, int nr[])
+{
+	dwEnc = ENC_ALL;
+
+	//check for UTF-8:----------------------------------------------->UTF8<----------------------------------------
+	if (*wPos >= 0xF0)
+	{
+		//UTF-8 4 bytes:
+		if (*wPos > 0xF4) dwEnc &= ~ENC_UTF8;
+		else if (nMax < 4) dwEnc &= ~ENC_UTF8;
+
+		else //nMax >= 4, so we can check the other THREE bytes
+		{
+			if (*wPos == 0xF0)
+			{
+				//the other 3 bytes should be: 90->BF 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x90 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF &&
+					*(wPos + 3) >= 0x80 && *(wPos + 3) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 4;
+			}
+
+			else if (*wPos >= 0xF1 && *wPos <= 0xF3)
+			{
+				//the other 3 bytes should be: 80->BF 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF &&
+					*(wPos + 3) >= 0x80 && *(wPos + 3) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 4;
+			}
+
+			else if (*wPos == 0xF4)
+			{
+				//the other 3 bytes should be: 80->8F 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0x8F &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF &&
+					*(wPos + 3) >= 0x80 && *(wPos + 3) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 4;
+			}
+		}
+	}
+
+	else if (*wPos >= 0xE0)
+	{
+		//UTF-8 3 bytes:
+		if (*wPos > 0xEF) dwEnc &= ~ENC_UTF8;
+		else if (nMax < 3) dwEnc &= ~ENC_UTF8;
+
+		else
+		{
+			//nMax >= 3, so we can check the other TWO bytes
+			if (*wPos == 0xE0)
+			{
+				//the other 2 bytes should be: A0->BF 80->BF
+				if (!(*(wPos + 1) >= 0xA0 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+			
+			else if (*wPos >= 0xE1 && *wPos <= 0xEC)
+			{
+				//the other 2 bytes should be: 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+
+			else if (*wPos == 0xED)
+			{
+				//the other 2 bytes should be: 80->9F 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0x9F &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+
+			else if (*wPos >= 0xEE && *wPos <= 0xEF)
+			{
+				//the other 2 bytes should be: 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+		}
+	}
+
+	else if (*wPos >= 0xC2)
+	{
+		//UTF-8 2 bytes:
+		if (*wPos > 0xDF) dwEnc &= ~ENC_UTF8;
+		else if (nMax < 2) dwEnc &= ~ENC_UTF8;
+
+		else //nMax >= 2, so we can check the other ONE byte
+		{
+			//the other 1 byte should be: 80->BF
+			if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+			else nr[NRENC_UTF8] = 2;
+		}
+	}
+
+	else if (*wPos > 0x7F)
+	{
+		//non-utf-8 (0x7F < *wPos < 0xC2)
+		dwEnc &= ~ENC_UTF8;
+	}
+	else nr[NRENC_UTF8] = 1;
+
+	//check for UTF-16LE:----------------------------------------------->UTF16-LE<-------------------------------------
+	if (dwEnc & ENC_UTF16LE)
+	{
+		//FF FE == 0xFEFF (HI = FE (second); LO = FF (first))
+		if (nMax < 4)
+		{
+			//should not be surogates:
+			//makeword(low, high)
+			//WORD val = MAKEWORD(*wPos, *(wPos + 1));
+			//if (val > 0xD7FF)//surrogate!
+			//	dwEnc &= ~ENC_UTF16LE;
+			/*else */nr[NRENC_UTF16LE] = 2;
+		}
+
+		else //nMax >= 4
+		{
+			//WORD val = MAKEWORD(*wPos, *(wPos + 1));
+			//if (val > 0xD7FF)//surrogate!
+			//{
+			//	//high surrogate must be in the range: U+D800 to U+DBFF
+			//	if (val > 0xDBFF)//invalid for HIGH SUROGATE!
+			//	{
+			//		dwEnc &= ~ENC_UTF16LE;
+			//	}
+			//	else
+			//	{
+			//		WORD val2 = MAKEWORD(*(wPos + 2), *(wPos + 3));
+			//		//low surrogate must be in the range: U+DC00 to U+DFFF
+			//		if (!(val2 >= 0xDC00 && val2 <= 0xDFFF))
+			//			dwEnc &= ~ENC_UTF16LE;
+			//		else nr[NRENC_UTF16LE] = 4;
+			//	}
+			//}
+			//else <= U+D7FF (no surrogate, valid UTF)
+			/*else */nr[NRENC_UTF16LE] = 2;
+		}
+	}
+
+	//check for UTF-16BE:----------------------------------------------->UTF16-BE<-------------------------------------
+	if (dwEnc & ENC_UTF16BE)
+	{
+		//FE FF == 0xFEFF (HI = FF (first); LO = FE (second))
+		if (nMax < 4)
+		{
+			//should not be surogates:
+			//makeword(low, high)
+			//WORD val = MAKEWORD(*(wPos + 1), *wPos);
+			//if (val > 0xD7FF)//surrogate!
+			//	dwEnc &= ~ENC_UTF16BE;
+			/*else */nr[NRENC_UTF16BE] = 2;
+		}
+
+		else //nMax >= 4
+		{
+			//WORD val = MAKEWORD(*(wPos + 1), *wPos);
+			//if (val > 0xD7FF)//surrogate!
+			//{
+			//	//high surrogate must be in the range: U+D800 to U+DBFF
+			//	if (val > 0xDBFF)//invalid for HIGH SUROGATE!
+			//	{
+			//		dwEnc &= ~ENC_UTF16BE;
+			//	}
+			//	else
+			//	{
+			//		WORD val2 = MAKEWORD(*(wPos + 3), *(wPos + 2));
+			//		//low surrogate must be in the range: U+DC00 to U+DFFF
+			//		if (!(val2 >= 0xDC00 && val2 <= 0xDFFF))
+			//			dwEnc &= ~ENC_UTF16BE;
+			//		else nr[NRENC_UTF16BE] = 4;
+			//	}
+			//}
+			//else <= U+D7FF (no surrogate, valid UTF)
+			/*else */nr[NRENC_UTF16BE] = 2;
+		}
+	}
+
+	//check for ASCII:----------------------------------------------->ASCII<----------------------------------------
+	if (*wPos > 0x7F)
+	{
+		dwEnc &= ~ENC_ASCII;
+	}
+	else nr[NRENC_ASCII] = 1;
+
+	return dwEnc;
+}
+
+BOOL CSearchAppDlg::GetNextChar(const BYTE* wPos, DWORD& dwEnc, DWORD nMax, int nr[], BOOL& bNeedMore, const QWORD& nMaxFile)
+{
+	dwEnc = ENC_ALL;
+	bNeedMore = FALSE;
+
+	//check for UTF-8:----------------------------------------------->UTF8<----------------------------------------
+	if (*wPos >= 0xF0)
+	{
+		//UTF-8 4 bytes:
+		if (*wPos > 0xF4) dwEnc &= ~ENC_UTF8;
+		else if (nMax < 4) {dwEnc &= ~ENC_UTF8; bNeedMore = TRUE; if (nMaxFile >= 4) return FALSE;}
+
+		else //nMax >= 4, so we can check the other THREE bytes
+		{
+			if (*wPos == 0xF0)
+			{
+				//the other 3 bytes should be: 90->BF 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x90 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF &&
+					*(wPos + 3) >= 0x80 && *(wPos + 3) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 4;
+			}
+
+			else if (*wPos >= 0xF1 && *wPos <= 0xF3)
+			{
+				//the other 3 bytes should be: 80->BF 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF &&
+					*(wPos + 3) >= 0x80 && *(wPos + 3) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 4;
+			}
+
+			else if (*wPos == 0xF4)
+			{
+				//the other 3 bytes should be: 80->8F 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0x8F &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF &&
+					*(wPos + 3) >= 0x80 && *(wPos + 3) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 4;
+			}
+		}
+	}
+
+	else if (*wPos >= 0xE0)
+	{
+		//UTF-8 3 bytes:
+		if (*wPos > 0xEF) dwEnc &= ~ENC_UTF8;
+		else if (nMax < 3) {dwEnc &= ~ENC_UTF8; bNeedMore = TRUE; if (nMaxFile >= 3) return FALSE;}
+
+		else
+		{
+			//nMax >= 3, so we can check the other TWO bytes
+			if (*wPos == 0xE0)
+			{
+				//the other 2 bytes should be: A0->BF 80->BF
+				if (!(*(wPos + 1) >= 0xA0 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+			
+			else if (*wPos >= 0xE1 && *wPos <= 0xEC)
+			{
+				//the other 2 bytes should be: 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+
+			else if (*wPos == 0xED)
+			{
+				//the other 2 bytes should be: 80->9F 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0x9F &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+
+			else if (*wPos >= 0xEE && *wPos <= 0xEF)
+			{
+				//the other 2 bytes should be: 80->BF 80->BF
+				if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF &&
+					*(wPos + 2) >= 0x80 && *(wPos + 2) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+				else nr[NRENC_UTF8] = 3;
+			}
+		}
+	}
+
+	else if (*wPos >= 0xC2)
+	{
+		//UTF-8 2 bytes:
+		if (*wPos > 0xDF) dwEnc &= ~ENC_UTF8;
+		else if (nMax < 2) {dwEnc &= ~ENC_UTF8; bNeedMore = TRUE; if (nMaxFile >= 2) return FALSE;}
+
+		else //nMax >= 2, so we can check the other ONE byte
+		{
+			//the other 1 byte should be: 80->BF
+			if (!(*(wPos + 1) >= 0x80 && *(wPos + 1) <= 0xBF)) dwEnc &= ~ENC_UTF8;
+			else nr[NRENC_UTF8] = 2;
+		}
+	}
+
+	else if (*wPos > 0x7F)
+	{
+		//non-utf-8 (0x7F < *wPos < 0xC2)
+		dwEnc &= ~ENC_UTF8;
+	}
+	else nr[NRENC_UTF8] = 1;
+
+	//check for UTF-16LE:----------------------------------------------->UTF16-LE<-------------------------------------
+	if (dwEnc & ENC_UTF16LE)
+	{
+		//FF FE == 0xFEFF (HI = FE (second); LO = FF (first))
+		if (nMax < 4)
+		{
+			bNeedMore = TRUE;
+			if (nMaxFile >= 4) return FALSE;
+			//should not be surogates:
+			//makeword(low, high)
+			//WORD val = MAKEWORD(*wPos, *(wPos + 1));
+			nr[NRENC_UTF16LE] = 2;
+		}
+
+		else //nMax >= 4
+		{
+			//WORD val = MAKEWORD(*wPos, *(wPos + 1));
+			nr[NRENC_UTF16LE] = 2;
+		}
+	}
+
+	//check for UTF-16BE:----------------------------------------------->UTF16-BE<-------------------------------------
+	if (dwEnc & ENC_UTF16BE)
+	{
+		//FE FF == 0xFEFF (HI = FF (first); LO = FE (second))
+		if (nMax < 4)
+		{
+			bNeedMore = TRUE;
+			if (nMaxFile >= 4) return FALSE;
+			//should not be surogates:
+			//makeword(low, high)
+			//WORD val = MAKEWORD(*(wPos + 1), *wPos);
+			nr[NRENC_UTF16BE] = 2;
+		}
+
+		else //nMax >= 4
+		{
+			//WORD val = MAKEWORD(*(wPos + 1), *wPos);
+			nr[NRENC_UTF16BE] = 2;
+		}
+	}
+
+	//check for ASCII:----------------------------------------------->ASCII<----------------------------------------
+	if (*wPos > 0x7F)
+	{
+		dwEnc &= ~ENC_ASCII;
+	}
+	else nr[NRENC_ASCII] = 1;
+
+	return dwEnc;
+}
+
+BOOL CSearchAppDlg::CheckCharEncCS(const BYTE* wcContents, const BYTE* wcSearch, DWORD& dwEnc, int* nr, int nrMaxSearch)
+{
+	//we retrieve each char as its encodings and compare it to the current character in the search str.
+	//the encodings that fail will have the "nr" set to 0.
+
+	//x can only be 1!
+	DWORD x = *(nr + NRENC_ASCII);
+	if (x)
+	{
+		//the search string is little endian! (as far as I know)
+		WORD wSearch = *((WCHAR*)wcSearch);
+
+		if (*wcContents != wSearch)
+			*(nr + NRENC_ASCII) = 0;
+	}
+
+	//nr can be 2 or 4!
+	x = *(nr + NRENC_UTF16LE);
+	if (x)
+	{
+		if (x == 2)
+		{
+			if (nrMaxSearch < 2)
+				*(nr + NRENC_UTF16LE) = 0;
+
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch = *((WCHAR*)wcSearch);
+
+				WORD wCont = MAKEWORD(*wcContents, *(wcContents + 1));
+				if (wCont != wSearch)
+					 *(nr + NRENC_UTF16LE) = 0;
+			}
+		}
+
+		else //x == 4
+		{
+			if (nrMaxSearch < 4)
+				*(nr + NRENC_UTF16LE) = 0;
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch1 = MAKEWORD(*wcSearch, *(wcSearch + 1));
+				WORD wSearch2 = MAKEWORD(*(wcSearch + 2), *(wcSearch + 3));
+
+				WORD wCont1 = MAKEWORD(*wcContents, *(wcContents + 1));
+				WORD wCont2 = MAKEWORD(*(wcContents + 2), *(wcContents + 3));
+
+				if (wCont1 != wSearch1 || wCont2 != wSearch2)
+					 *(nr + NRENC_UTF16LE) = 0;
+			}
+		}
+	}
+
+	//nr can be 2 or 4!
+	x = *(nr + NRENC_UTF16BE);
+	if (x)
+	{
+		if (x == 2)
+		{
+			if (nrMaxSearch < 2)
+				*(nr + NRENC_UTF16BE) = 0;
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch = *((WCHAR*)wcSearch);
+
+				WORD wCont = MAKEWORD(*(wcContents + 1), *wcContents);
+				if (wCont != wSearch)
+					 *(nr + NRENC_UTF16BE) = 0;
+			}
+		}
+
+		else //x == 4
+		{
+			if (nrMaxSearch < 4)
+				*(nr + NRENC_UTF16BE) = 0;
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch1 = MAKEWORD(*(wcSearch + 1), *wcSearch);
+				WORD wSearch2 = MAKEWORD(*(wcSearch + 3), *(wcSearch + 2));
+
+				WORD wCont1 = MAKEWORD(*(wcContents + 1), *wcContents);
+				WORD wCont2 = MAKEWORD(*(wcContents + 3), *(wcContents + 2));
+
+				if (wCont1 != wSearch1 || wCont2 != wSearch2)
+					 *(nr + NRENC_UTF16LE) = 0;
+			}
+		}
+	}
+
+	//nr can be 1 or 2 or 3 or 4
+	x = *(nr + NRENC_UTF8);
+	if (x)
+	{		
+		WCHAR wcChar[2];
+		int nrUsed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (LPCSTR)wcContents, x, wcChar, 2);
+		if (!nrUsed)
+		{
+			*(nr + NRENC_UTF8) = 0;
+			/*DWORD dwError = GetLastError();
+			if (dwError != ERROR_NO_UNICODE_TRANSLATION) DisplayError(dwError);*/
+		}
+
+		else if (nrUsed == 1)
+		{
+			if (nrMaxSearch < 2)
+				*(nr + NRENC_UTF8) = 0;
+
+			else if (*wcChar != *((WCHAR*)wcSearch))
+				*(nr + NRENC_UTF8) = 0;
+		}
+
+		else if (nrUsed == 2)
+		{
+			if (nrMaxSearch < 4)
+				*(nr + NRENC_UTF8) = 0;
+
+			else
+			{
+				WORD wSearch1 = MAKEWORD(*wcSearch, *(wcSearch + 1));
+				WORD wSearch2 = MAKEWORD(*(wcSearch + 2), *(wcSearch + 3));
+
+				if (*wcChar != wSearch1 || *(wcChar + 1) != wSearch2)
+					 *(nr + NRENC_UTF8) = 0;
+			}
+		}
+	}
+
+	int max = *(nr + NRENC_ASCII);
+	if (max < *(nr + NRENC_UTF16LE)) max = *(nr + NRENC_UTF16LE);
+	if (max < *(nr + NRENC_UTF16BE)) max = *(nr + NRENC_UTF16BE);
+	if (max < *(nr + NRENC_UTF8)) max = *(nr + NRENC_UTF8);
+
+	if (!nr[NRENC_ASCII]) dwEnc &= ~ENC_ASCII;
+	if (!nr[NRENC_UTF16LE]) dwEnc &= ~ENC_UTF16LE;
+	if (!nr[NRENC_UTF16BE]) dwEnc &= ~ENC_UTF16BE;
+	if (!nr[NRENC_UTF8]) dwEnc &= ~ENC_UTF8;
+
+	return max;
+}
+
+BOOL CSearchAppDlg::CheckCharEnc(const BYTE* wcContents, const BYTE* wcSearch, DWORD& dwEnc, int* nr, int nrMaxSearch)
+{
+	//we retrieve each char as its encodings and compare it to the current character in the search str.
+	//the encodings that fail will have the "nr" set to 0.
+
+	//x can only be 1!
+	DWORD x = *(nr + NRENC_ASCII);
+	if (x)
+	{
+		//the search string is little endian! (as far as I know)
+		WORD wSearch = *((WCHAR*)wcSearch);
+
+		if (tolower(*wcContents) != tolower(wSearch))
+			*(nr + NRENC_ASCII) = 0;
+	}
+
+	//nr can be 2 or 4!
+	x = *(nr + NRENC_UTF16LE);
+	if (x)
+	{
+		if (x == 2)
+		{
+			if (nrMaxSearch < 2)
+				*(nr + NRENC_UTF16LE) = 0;
+
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch = *((WCHAR*)wcSearch);
+
+				WORD wCont = MAKEWORD(*wcContents, *(wcContents + 1));
+				if (tolower(wCont) != tolower(wSearch))
+					 *(nr + NRENC_UTF16LE) = 0;
+			}
+		}
+
+		else //x == 4
+		{
+			if (nrMaxSearch < 4)
+				*(nr + NRENC_UTF16LE) = 0;
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch1 = MAKEWORD(*wcSearch, *(wcSearch + 1));
+				WORD wSearch2 = MAKEWORD(*(wcSearch + 2), *(wcSearch + 3));
+
+				WORD wCont1 = MAKEWORD(*wcContents, *(wcContents + 1));
+				WORD wCont2 = MAKEWORD(*(wcContents + 2), *(wcContents + 3));
+
+				if (tolower(wCont1) != tolower(wSearch1) || tolower(wCont2) != tolower(wSearch2))
+					 *(nr + NRENC_UTF16LE) = 0;
+			}
+		}
+	}
+
+	//nr can be 2 or 4!
+	x = *(nr + NRENC_UTF16BE);
+	if (x)
+	{
+		if (x == 2)
+		{
+			if (nrMaxSearch < 2)
+				*(nr + NRENC_UTF16BE) = 0;
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch = *((WCHAR*)wcSearch);
+
+				WORD wCont = MAKEWORD(*(wcContents + 1), *wcContents);
+				if (tolower(wCont) != tolower(wSearch))
+					 *(nr + NRENC_UTF16BE) = 0;
+			}
+		}
+
+		else //x == 4
+		{
+			if (nrMaxSearch < 4)
+				*(nr + NRENC_UTF16BE) = 0;
+			else
+			{
+				//the search string is little endian! (as far as I know)
+				WORD wSearch1 = MAKEWORD(*(wcSearch + 1), *wcSearch);
+				WORD wSearch2 = MAKEWORD(*(wcSearch + 3), *(wcSearch + 2));
+
+				WORD wCont1 = MAKEWORD(*(wcContents + 1), *wcContents);
+				WORD wCont2 = MAKEWORD(*(wcContents + 3), *(wcContents + 2));
+
+				if (tolower(wCont1) != tolower(wSearch1) || tolower(wCont2) != tolower(wSearch2))
+					 *(nr + NRENC_UTF16LE) = 0;
+			}
+		}
+	}
+
+	//nr can be 1 or 2 or 3 or 4
+	x = *(nr + NRENC_UTF8);
+	if (x)
+	{		
+		WCHAR wcChar[2];
+		int nrUsed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (LPCSTR)wcContents, x, wcChar, 2);
+		if (!nrUsed)
+		{
+			*(nr + NRENC_UTF8) = 0;
+			/*DWORD dwError = GetLastError();
+			if (dwError != ERROR_NO_UNICODE_TRANSLATION) DisplayError(dwError);*/
+		}
+
+		else if (nrUsed == 1)
+		{
+			if (nrMaxSearch < 2)
+				*(nr + NRENC_UTF8) = 0;
+
+			else if (tolower(*wcChar) != tolower(*((WCHAR*)wcSearch)))
+				*(nr + NRENC_UTF8) = 0;
+		}
+
+		else if (nrUsed == 2)
+		{
+			if (nrMaxSearch < 4)
+				*(nr + NRENC_UTF8) = 0;
+
+			else
+			{
+				WORD wSearch1 = MAKEWORD(*wcSearch, *(wcSearch + 1));
+				WORD wSearch2 = MAKEWORD(*(wcSearch + 2), *(wcSearch + 3));
+
+				if (tolower(*wcChar) != tolower(wSearch1) || tolower(*(wcChar + 1)) != tolower(wSearch2))
+					 *(nr + NRENC_UTF8) = 0;
+			}
+		}
+	}
+
+	int max = *(nr + NRENC_ASCII);
+	if (max < *(nr + NRENC_UTF16LE)) max = *(nr + NRENC_UTF16LE);
+	if (max < *(nr + NRENC_UTF16BE)) max = *(nr + NRENC_UTF16BE);
+	if (max < *(nr + NRENC_UTF8)) max = *(nr + NRENC_UTF8);
+
+	if (!nr[NRENC_ASCII]) dwEnc &= ~ENC_ASCII;
+	if (!nr[NRENC_UTF16LE]) dwEnc &= ~ENC_UTF16LE;
+	if (!nr[NRENC_UTF16BE]) dwEnc &= ~ENC_UTF16BE;
+	if (!nr[NRENC_UTF8]) dwEnc &= ~ENC_UTF8;
+
+	return max;
+}
+
+void CSearchAppDlg::LoadFilters()
+{
+	m_FilterList.erase_all();
+
+	//ok, get to HKLM\Software\Classes and go to the first '.'
+	HKEY hKey;
+	DWORD dwError = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software", 0, KEY_READ, &hKey);
+	if (dwError != 0)
+	{
+		return;
+	}
+
+	HKEY hAux = hKey;
+	dwError = RegOpenKeyExW(hAux, L"Classes", 0, KEY_READ, &hKey);
+	if (dwError != 0)
+	{
+		RegCloseKey(hAux);
+		return;
+	}
+	RegCloseKey(hAux);
+
+	//enumerate the subkeys:
+	WCHAR wsKeyName[256];
+	DWORD nKeyNameLen = 256;
+	int nIndex = 0;
+	WCHAR lastchar = 0;
+	do
+	{
+		dwError = RegEnumKeyExW(hKey, nIndex, wsKeyName, &nKeyNameLen, NULL, NULL, NULL, NULL);
+		if (dwError != 0)
+		{
+			RegCloseKey(hKey);
+			return;
+		}
+
+		TryLoadFilter(hKey, wsKeyName, lastchar);
+
+		nIndex++;
+		nKeyNameLen = 256;
+	}while (*wsKeyName <= '.');
+
+	RegCloseKey(hKey);
+}
+
+void CSearchAppDlg::TryLoadFilter(const HKEY hParentKey, WCHAR* wsKeyName, WCHAR& lastchar)
+{
+	//check to see if it has a filter associated
+	//first, open that key
+	HKEY hFilter;
+	DWORD dwError = RegOpenKeyExW(hParentKey, wsKeyName, 0, KEY_READ, &hFilter);
+	if (dwError != 0)
+	{
+		return;
+	}
+
+	//retrieve the default value of PersistentHandler
+	WCHAR wsValueName[100];
+	DWORD nValueNameLen = 100;
+	dwError = RegGetValueW(hFilter, L"PersistentHandler", 0, RRF_RT_REG_SZ, 0, (void*)wsValueName, &nValueNameLen);
+	if (dwError != 0)
+	{
+		RegCloseKey(hFilter);
+
+		//retrieve the handler from the CLSID of the filetype:
+		//1. retrieve the filetype = default value of wsKeyName key.
+		nValueNameLen = 100;
+		dwError = RegGetValueW(hParentKey, wsKeyName, 0, RRF_RT_REG_SZ, 0, wsValueName, &nValueNameLen);
+		if (dwError != 0)
+		{
+			return;
+		}
+
+		//2. get into HKLM\Software\Classes\<filetype>
+		DWORD dwError = RegOpenKeyExW(hParentKey, wsValueName, 0, KEY_READ, &hFilter);
+		if (dwError != 0)
+		{
+			return;
+		}
+
+		//3. get the default value of this key's CLSID. 
+		nValueNameLen = 100;
+		dwError = RegGetValueW(hFilter, L"CLSID", 0, RRF_RT_REG_SZ, 0, wsValueName, &nValueNameLen);
+		if (dwError != 0)
+		{
+			RegCloseKey(hFilter);
+			return;
+		}
+		RegCloseKey(hFilter);
+
+		//4. go to HKLM\Software\Classes\CLSID
+		dwError = RegOpenKeyExW(hParentKey, L"CLSID", 0, KEY_READ, &hFilter);
+		if (dwError != 0)
+		{
+			return;
+		}
+
+		HKEY hAux = hFilter;
+
+		//5. go to HKLM\Software\Classes\CLSID\<givenCLSID>
+		dwError = RegOpenKeyExW(hAux, wsValueName, 0, KEY_READ, &hFilter);
+		if (dwError != 0)
+		{
+			RegCloseKey(hAux);
+			return;
+		}
+		RegCloseKey(hAux);
+
+		//6. retrieve "PersistentHandler" from there
+		nValueNameLen = 100;
+		dwError = RegGetValueW(hFilter, L"PersistentHandler", 0, RRF_RT_REG_SZ, 0, wsValueName, &nValueNameLen);
+		if (dwError != 0)
+		{
+			RegCloseKey(hFilter);
+			return;
+		}
+	}
+	RegCloseKey(hFilter);
+
+	//we now must have the PersistentHandler. we now need the filter:
+	//the following path will be: HKLM\Classes\CLSID
+	dwError = RegOpenKeyExW(hParentKey, L"CLSID", 0, KEY_READ, &hFilter);
+	if (dwError != 0)
+	{
+		return;
+	}
+
+	//the following path will be: HKLM\Classes\CLSID\<PersistentHandlerCLSID>
+	HKEY hAux = hFilter;
+	dwError = RegOpenKeyExW(hAux, wsValueName, 0, KEY_READ, &hFilter);
+	if (dwError != 0)
+	{
+		RegCloseKey(hAux);
+		return;
+	}
+
+	//the following path will be: HKLM\Classes\CLSID\<PersistentHandlerCLSID>\PersistentAddinsRegistered
+	hAux = hFilter;
+	dwError = RegOpenKeyExW(hAux, L"PersistentAddinsRegistered", 0, KEY_READ, &hFilter);
+	if (dwError != 0)
+	{
+		RegCloseKey(hAux);
+		return;
+	}
+	RegCloseKey(hAux);
+
+	//we get the default value of the IID_IFilter CLSID key
+	nValueNameLen = 100;
+	dwError = RegGetValueW(hFilter, L"{89BCB740-6119-101A-BCB7-00DD010655AF}", 0, RRF_RT_REG_SZ, 0, wsValueName, &nValueNameLen);
+	if (dwError != 0)
+	{
+		RegCloseKey(hFilter);
+		return;
+	}
+	RegCloseKey(hFilter);
+
+	//creating the IClassFactory
+	CLSID cls;
+	HRESULT hr = CLSIDFromString(wsValueName, &cls);
+
+	IClassFactory* pClassFactory;
+	hr = CoGetClassObject(cls, CLSCTX_ALL, NULL, IID_IClassFactory, (void**)&pClassFactory);
+	if (FAILED(hr)) return;
+
+	wsKeyName++;
+	if (towlower(lastchar) == towlower(*wsKeyName))
+	{
+		CDoubleList<FILTERLIST>::Iterator I;
+
+		for (I = m_FilterList.begin(); I != NULL; I = I->pNext)
+		{
+			if (I->m_Value.letter == lastchar)
+			{
+				FILTER filter;
+				int len = wcslen(wsKeyName);
+				len++;
+
+				filter.wsExt = new WCHAR[len];
+				StringCchCopyW(filter.wsExt, len, wsKeyName);
+				filter.pClassFactory = pClassFactory;
+				I->m_Value.pFilterList->push_back(filter);
+			}
+		}
+
+	}
+	else
+	{
+		//init filter:
+		lastchar = *wsKeyName;
+
+		FILTERLIST filterlist;
+		filterlist.letter = towlower(lastchar);
+		filterlist.pFilterList = new CDoubleList<FILTER>(OnDestroyFilter);
+
+		FILTER filter;
+		int len = wcslen(wsKeyName);
+		len++;
+
+		filter.wsExt = new WCHAR[len];
+		StringCchCopyW(filter.wsExt, len, wsKeyName);
+		filter.pClassFactory = pClassFactory;
+
+		filterlist.pFilterList->push_back(filter);
+		m_FilterList.push_back(filterlist);
+	}
+}
+
+IClassFactory* CSearchAppDlg::FindFilter(const WCHAR* wsExtName)
+{
+	CDoubleList<FILTERLIST>::Iterator I;
+
+	for (I = m_FilterList.begin(); I != NULL; I = I->pNext)
+	{
+		if (I->m_Value.letter == *wsExtName)
+		{
+			CDoubleList<FILTER>::Iterator J;
+			for (J = I->m_Value.pFilterList->begin(); J != NULL; J = J->pNext)
+			{
+				if (wcscmp(wsExtName, J->m_Value.wsExt) == 0) return J->m_Value.pClassFactory;
+			}
+
+			return NULL;
+		}
+	}
+
+	return NULL;
+}
+
+BOOL CSearchAppDlg::SearchUsingFilterCS(const WCHAR* wsFullName, const WCHAR* wsSearchContents, IClassFactory* pClassFactory, WIN32_FILE_ATTRIBUTE_DATA& data)
+{
+	IFilter* pFilter;
+	HRESULT hr = pClassFactory->CreateInstance(NULL, IID_IFilter, (void**)&pFilter);
+	if (FAILED(hr))
+	{
+		return FALSE;
+	}
+
+	IPersistFile* pPersistFile;
+	hr = pFilter->QueryInterface(IID_IPersistFile, (void**)&pPersistFile);
+	if (FAILED(hr)) {pFilter->Release(); return FALSE;}
+
+	hr = pPersistFile->Load(wsFullName, STGM_READ);
+	if (FAILED(hr)) {pFilter->Release(); pPersistFile->Release(); return FALSE;}
+
+	ULONG finit = IFILTER_INIT_CANON_HYPHENS | IFILTER_INIT_CANON_PARAGRAPHS | IFILTER_INIT_CANON_SPACES |
+						IFILTER_INIT_APPLY_INDEX_ATTRIBUTES | IFILTER_INIT_HARD_LINE_BREAKS | IFILTER_INIT_FILTER_OWNED_VALUE_OK;
+	ULONG flags;
+	hr = pFilter->Init(finit, 0, 0, &flags);
+	if (FAILED(hr)) {pFilter->Release(); pPersistFile->Release(); return FALSE;}
+
+	STAT_CHUNK chunk;
+	chunk.flags = (CHUNKSTATE)0;
+
+	LARGE_INTEGER liSize;
+	liSize.HighPart = data.nFileSizeHigh;
+	liSize.LowPart = data.nFileSizeLow;
+
+	DWORD cbText, cbMaxText;
+
+	if (liSize.QuadPart > 0xA00000)
+		cbText = 0x500000;
+	else cbText = liSize.LowPart;
+	cbMaxText = cbText;
+
+	WCHAR* wsText = new WCHAR[cbText];
+
+	int pointer = 0;
+	int contLen = wcslen(wsSearchContents);
+
+	WCHAR* LastPart = NULL;
+	DWORD nLastPartSize = 0;
+	DWORD iFirstFound = (DWORD)-1;
+
+	do
+	{
+		hr = pFilter->GetChunk(&chunk);
+		
+		if (SUCCEEDED(hr))
+		{
+			if (chunk.flags == CHUNK_TEXT)
+			{
+				while (SUCCEEDED(hr))
+				{
+					if (LastPart)
+					{
+						memcpy_s(wsText, cbMaxText * 2, LastPart, nLastPartSize * 2);
+						delete[] LastPart;
+						LastPart = NULL;
+					}
+
+					cbText = cbMaxText - nLastPartSize;
+
+					hr = pFilter->GetText(&cbText, wsText + nLastPartSize);
+					if (SUCCEEDED(hr))
+					{
+						for (DWORD i = 0; i < cbText; i++)
+						{
+							if (*(wsSearchContents + pointer) == *(wsText + i))
+							{
+								pointer++;
+
+								if (iFirstFound == (DWORD)-1)
+									iFirstFound = i;
+
+								if (pointer == contLen)
+								{
+									delete[] wsText;
+									pFilter->Release();
+									pPersistFile->Release();
+									return TRUE;
+								}
+							}
+							else 
+							{
+								if (pointer)
+								{
+									if (iFirstFound == (DWORD)-1)
+									{
+										i = 0;
+									}
+
+									else
+									{
+										i = iFirstFound;
+										iFirstFound = (DWORD)-1;
+									}
+
+									pointer = 0;
+								}
+							}
+						}
+
+						//ok, if we've searched through all the chunk, but the chunk ended before we reached the end.
+						if (pointer)
+						{
+							if (iFirstFound != (DWORD)-1)
+							{
+								nLastPartSize = cbText - iFirstFound;
+
+								if (LastPart) delete[] LastPart;
+								LastPart = new WCHAR[nLastPartSize];
+								memcpy_s(LastPart, nLastPartSize * 2, wsText + iFirstFound, nLastPartSize * 2);
+								iFirstFound = 0;
+							}
+
+							else
+							{
+								nLastPartSize = 0;
+							}
+
+							pointer = 0;
+						}
+					}
+
+					cbText = cbMaxText;
+				}
+			}
+		}
+
+		else break;
+
+	} while (SUCCEEDED(hr));
+
+	delete[] wsText;
+	pPersistFile->Release();
+	pFilter->Release();
+
+	return FALSE;
+}
+
+BOOL CSearchAppDlg::SearchUsingFilterNCS(const WCHAR* wsFullName, const WCHAR* wsSearchContents, IClassFactory* pClassFactory, WIN32_FILE_ATTRIBUTE_DATA& data)
+{
+	IFilter* pFilter;
+	HRESULT hr = pClassFactory->CreateInstance(NULL, IID_IFilter, (void**)&pFilter);
+	if (FAILED(hr))
+	{
+		return FALSE;
+	}
+
+	IPersistFile* pPersistFile;
+	hr = pFilter->QueryInterface(IID_IPersistFile, (void**)&pPersistFile);
+	if (FAILED(hr)) {pFilter->Release(); return FALSE;}
+
+	hr = pPersistFile->Load(wsFullName, STGM_READ);
+	if (FAILED(hr)) {pFilter->Release(); pPersistFile->Release(); return FALSE;}
+
+	ULONG finit = IFILTER_INIT_CANON_HYPHENS | IFILTER_INIT_CANON_PARAGRAPHS | IFILTER_INIT_CANON_SPACES |
+						IFILTER_INIT_APPLY_INDEX_ATTRIBUTES | IFILTER_INIT_HARD_LINE_BREAKS | IFILTER_INIT_FILTER_OWNED_VALUE_OK;
+	ULONG flags;
+	hr = pFilter->Init(finit, 0, 0, &flags);
+	if (FAILED(hr)) {pFilter->Release(); pPersistFile->Release(); return FALSE;}
+
+	STAT_CHUNK chunk;
+	chunk.flags = (CHUNKSTATE)0;
+
+	LARGE_INTEGER liSize;
+	liSize.HighPart = data.nFileSizeHigh;
+	liSize.LowPart = data.nFileSizeLow;
+
+	DWORD cbText, cbMaxText;
+
+	if (liSize.QuadPart > 0xA00000)
+		cbText = 0x500000;
+	else cbText = liSize.LowPart;
+	cbMaxText = cbText;
+
+	WCHAR* wsText = new WCHAR[cbText];
+
+	int pointer = 0;
+	int contLen = wcslen(wsSearchContents);
+
+	WCHAR* LastPart = NULL;
+	DWORD nLastPartSize = 0;
+	DWORD iFirstFound = (DWORD)-1;
+
+	do
+	{
+		hr = pFilter->GetChunk(&chunk);
+		
+		if (SUCCEEDED(hr))
+		{
+			if (chunk.flags == CHUNK_TEXT)
+			{
+				while (SUCCEEDED(hr))
+				{
+					if (LastPart)
+					{
+						memcpy_s(wsText, cbMaxText * 2, LastPart, nLastPartSize * 2);
+						delete[] LastPart;
+						LastPart = NULL;
+					}
+
+					cbText = cbMaxText - nLastPartSize;
+
+					hr = pFilter->GetText(&cbText, wsText + nLastPartSize);
+					if (SUCCEEDED(hr))
+					{
+						for (DWORD i = 0; i < cbText; i++)
+						{
+							if (towlower(*(wsSearchContents + pointer)) == towlower(*(wsText + i)))
+							{
+								pointer++;
+
+								if (iFirstFound == (DWORD)-1)
+									iFirstFound = i;
+
+								if (pointer == contLen)
+								{
+									delete[] wsText;
+									pFilter->Release();
+									pPersistFile->Release();
+									return TRUE;
+								}
+							}
+							else 
+							{
+								if (pointer)
+								{
+									if (iFirstFound == (DWORD)-1)
+									{
+										i = 0;
+									}
+
+									else
+									{
+										i = iFirstFound;
+										iFirstFound = (DWORD)-1;
+									}
+
+									pointer = 0;
+								}
+							}
+						}
+
+						//ok, if we've searched through all the chunk, but the chunk ended before we reached the end.
+						if (pointer)
+						{
+							if (iFirstFound != (DWORD)-1)
+							{
+								nLastPartSize = cbText - iFirstFound;
+
+								if (LastPart) delete[] LastPart;
+								LastPart = new WCHAR[nLastPartSize];
+								memcpy_s(LastPart, nLastPartSize * 2, wsText + iFirstFound, nLastPartSize * 2);
+								iFirstFound = 0;
+							}
+
+							else
+							{
+								nLastPartSize = 0;
+							}
+
+							pointer = 0;
+						}
+					}
+
+					cbText = cbMaxText;
+				}
+				hr = S_OK;
+			}
+		}
+
+		else break;
+
+	} while (SUCCEEDED(hr));
+
+	delete[] wsText;
+	pPersistFile->Release();
+	pFilter->Release();
+
+	return FALSE;
 }

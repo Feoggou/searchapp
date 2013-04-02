@@ -29,15 +29,20 @@ private:
 		//days of the week:
 		Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday,
 
-		//relative:
-		Today, Yesterday,
+		//this:
+		Today, ThisWeek, ThisMonth, ThisYear,
 
-		//last:
-		LastDay, LastWeek, LastMonth, LastYear,
+		//last
+		Yesterday, LastWeek, LastMonth, LastYear,
 
 		//counts
-		Days, Weeks, Months, Years,
-		Ago,
+		DaysAgo, WeeksAgo, MonthsAgo, YearsAgo,
+	};
+
+	struct KEY
+	{
+		KEYWORD nID;
+		WCHAR wsText[10];
 	};
 
 public:
@@ -47,6 +52,7 @@ public:
 	//private functions
 private:
 	static INT_PTR CALLBACK DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam);
+	//the procedure of a time edit
 	static LRESULT CALLBACK NewEditTimeProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 	INT_PTR OnInitDialog();
 	BOOL OnOK();
@@ -54,12 +60,19 @@ private:
 	BOOL CheckTimes(void);
 	//checks the time text.
 	BOOL CheckTimeText(WCHAR* wsText, int len, FILETIME& fileTime, BOOL bIsSince);
+	//transforms a day-of-the-week into a date
 	BOOL CalcDay(int iChosenDay, SYSTEMTIME& localTime, FILETIME& fileTime);
+	//decrease by a number of months
 	void DecMonth(WORD nCountDec, SYSTEMTIME& localTime);
+	//decrease by a number of days
 	BOOL DecDays(WORD nCountDec, SYSTEMTIME& localTime, FILETIME& fileTime);
+	//decrease by a number of weeks
 	BOOL DecWeeks(WORD nCountDec, SYSTEMTIME& localTime, FILETIME& fileTime);
+	//retrieves the next integer from the string and returns the position after the end of the integer
 	BOOL GetNextInt(int& nr, WCHAR** wPos);
+	//retrieves the keyword of the string that follows and returns the position after the end of that string.
 	BOOL GetNextString(WCHAR*& wPos, KEYWORD& key);
+	//initializes the time boxes with the data set before.
 	void InitializeTimeBoxes(void);
 
 public:

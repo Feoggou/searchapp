@@ -30,6 +30,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	InitFileSystemIconList();
 
 	mainDlg.DoModal();
+	mainDlg.~CSearchAppDlg();
 	OleUninitialize();
 	return 0;
 }
@@ -40,17 +41,14 @@ void InitFileSystemIconList()
     MYPROC FileIconInit = 0; 
  
     // Get a handle to the DLL module.
- 
     hinstLib = LoadLibrary(TEXT("Shell32.dll")); 
  
     // If the handle is valid, try to get the function address.
- 
     if (hinstLib != NULL) 
     { 
         FileIconInit = (MYPROC) GetProcAddress(hinstLib, (LPCSTR)MAKELPARAM(660, 0)); 
- 
+
         // If the function address is valid, call the function.
- 
         if (NULL == FileIconInit) 
         {
             MessageBox(0, L"Error loading a function from Shell32.DLL", 0, 0);

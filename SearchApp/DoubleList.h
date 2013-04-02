@@ -95,6 +95,7 @@ public:
 
 	Iterator pop_front()
 	{
+		if (is_empty()) return NULL;
 		if (OnDestroyItem)
 			OnDestroyItem(pFirst->m_Value);
 
@@ -104,7 +105,7 @@ public:
 
 		if (pFirst)
 			pFirst->pPrev = NULL;
-		else pLast = NULL;//pFirst
+		else pLast = NULL;
 
 		return pFirst;
 	}
@@ -189,7 +190,7 @@ public:
 		else pLast = prev;
 	}
 
-	void erase(Iterator From, Iterator To)
+	void erase(Iterator& From, Iterator& To)
 	{
 		//prev -- from  -- to -- next
 		Iterator prev = From->pPrev;

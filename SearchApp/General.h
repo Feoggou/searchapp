@@ -3,6 +3,9 @@
 #ifndef GENERAL_H
 
 #define WIN32_LEAN_AND_MEAN
+
+#include "targetver.h"
+
 #include <Windows.h>
 #include <Ole2.h>
 #include <Commctrl.h>
@@ -10,6 +13,7 @@
 #include <Shlobj.h>
 #include <strsafe.h>
 #include <Shellapi.h>
+#include <Filter.h>
 #include "DoubleList.h"
 
 #define QWORD UINT64

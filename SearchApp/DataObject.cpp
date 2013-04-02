@@ -6,9 +6,6 @@ CDataObject::CDataObject(void)
 {
 	m_cRef = 0;
 	m_nNumFormats = 0;
-
-//	memset(m_FormatEtc, 0, sizeof(FORMATETC) * 4);
-//	memset(m_StgMedium, 0, sizeof(STGMEDIUM) * 4);
 }
 
 
@@ -80,7 +77,8 @@ HRESULT CDataObject::GetData(FORMATETC *pFormatEtc, STGMEDIUM *pMedium)
     switch(m_FormatEtc[idx].tymed)
     {
     case TYMED_HGLOBAL:
-        pMedium->hGlobal     = m_StgMedium[idx].hGlobal;//DupGlobalMem(m_StgMedium[idx].hGlobal);
+		//there must be a copy of it, not itself.
+        pMedium->hGlobal     = DupGlobalMem(m_StgMedium[idx].hGlobal);
         break;
 
     default:

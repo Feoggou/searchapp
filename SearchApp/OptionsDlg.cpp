@@ -441,6 +441,24 @@ BOOL COptionsDlg::CheckTimeText(WCHAR* wsText, int len, FILETIME& fileTime, BOOL
 			{
 			}
 
+			else if (key == COptionsDlg::ThisWeek)
+			{
+				BOOL bResult = DecWeeks(0, localTime, fileTime);
+				delete[] wsResult;
+				return bResult;
+			}
+
+			else if (key == COptionsDlg::ThisMonth)
+			{
+				localTime.wDay = 1;
+			}
+
+			else if (key == COptionsDlg::ThisYear)
+			{
+				localTime.wDay = 1;
+				localTime.wMonth = 1;
+			}
+
 			else if (key == COptionsDlg::Yesterday)
 			{
 				BOOL bResult = DecDays(1, localTime, fileTime);
@@ -477,7 +495,7 @@ BOOL COptionsDlg::CheckTimeText(WCHAR* wsText, int len, FILETIME& fileTime, BOOL
 				return bResult;
 			}
 
-			else if (key == COptionsDlg::LastDay)
+			else if (key == COptionsDlg::Yesterday)
 			{
 				BOOL bResult = DecDays(1, localTime, fileTime);
 				delete[] wsResult;
@@ -623,7 +641,7 @@ BOOL COptionsDlg::CheckTimeText(WCHAR* wsText, int len, FILETIME& fileTime, BOOL
 			return false;
 		}
 		
-		else if (Key >= COptionsDlg::Days && Key <= COptionsDlg::Years)
+		else if (Key >= COptionsDlg::DaysAgo && Key <= COptionsDlg::YearsAgo)
 		{
 			//[X] (e.g. 5):
 			//days, weeks; months; years; + ago
@@ -643,14 +661,14 @@ BOOL COptionsDlg::CheckTimeText(WCHAR* wsText, int len, FILETIME& fileTime, BOOL
 
 			switch (Key)
 			{
-			case COptionsDlg::Days:
+			case COptionsDlg::DaysAgo:
 				{
 					BOOL bResult = DecDays((WORD)nr, localTime, fileTime);
 					delete[] wsResult;
 					return bResult;
 				}
 
-			case COptionsDlg::Weeks:
+			case COptionsDlg::WeeksAgo:
 				{
 					BOOL bResult = DecWeeks((WORD)nr, localTime, fileTime);
 					delete[] wsResult;
@@ -658,17 +676,17 @@ BOOL COptionsDlg::CheckTimeText(WCHAR* wsText, int len, FILETIME& fileTime, BOOL
 				}
 				break;
 
-			case COptionsDlg::Months:
+			case COptionsDlg::MonthsAgo:
 				{
 					DecMonth(1, localTime);
 				}
 				break;
 
-			case COptionsDlg::Years:
+			case COptionsDlg::YearsAgo:
 				{
 					localTime.wDay = 1;
 					localTime.wMonth = 1;
-					localTime.wYear -= nr;
+					localTime.wYear -= (WORD)nr;
 				}
 				break;
 			}
@@ -860,10 +878,10 @@ BOOL COptionsDlg::DecDays(WORD nCountDec, SYSTEMTIME& localTime, FILETIME& fileT
 
 BOOL COptionsDlg::DecWeeks(WORD nCountDec, SYSTEMTIME& localTime, FILETIME& fileTime)
 {
-	WORD nCount = localTime.wDayOfWeek + 7 * nCountDec - 1;
+	int nCount = localTime.wDayOfWeek + 7 * nCountDec - 1;
 	if  (localTime.wDayOfWeek == 0) nCount += 7;
 
-	return DecDays(nCount, localTime, fileTime);
+	return DecDays((WORD)nCount, localTime, fileTime);
 }
 
 BOOL COptionsDlg::GetNextInt(int& nr, WCHAR** wPos)
@@ -885,7 +903,6 @@ BOOL COptionsDlg::GetNextInt(int& nr, WCHAR** wPos)
 	return true;
 }
 
-
 BOOL COptionsDlg::GetNextString(WCHAR*& wPos, KEYWORD& key)
 {
 	WCHAR* wsStart = wPos;
@@ -902,224 +919,267 @@ BOOL COptionsDlg::GetNextString(WCHAR*& wPos, KEYWORD& key)
 	//hour; day; week; month; year;
 	//anytime
 
-	WCHAR wsKeys[][10] =
-//0 --> 11
-{L"january", L"february", L"march", L"april", L"may", L"june", L"july", L"august", L"september", L"october", L"november", L"december",
-//12 --> 23
-L"jan", L"feb", L"mar", L"apr", L"may", L"jun", L"jul", L"aug", L"sep", L"oct", L"nov", L"dec",
+	KEY item;
 
-//24 --> 30
-L"monday", L"tuesday", L"wednesday", L"thursday", L"friday", L"saturday", L"sunday",
-//31 --> 37
-L"mon", L"tue", L"wed", L"thu", L"fri", L"sat", L"sun",
+	CDoubleList<KEY>KeyList(NULL);
 
-//38 --> 43
-L"today", L"yesterday", L"lastday", L"lastweek", L"lastmonth", L"lastyear",
-//44 --> 45
-L"anytime", L"any",
+	//filling the list:
+	//a. months
+	item.nID = COptionsDlg::January;
+	StringCchCopyW(item.wsText, 10, L"january");
+	KeyList.push_back(item);
 
-//46 --> 49
-L"days", L"weeks", L"months", L"years",
+	item.nID = COptionsDlg::January;
+	StringCchCopyW(item.wsText, 10, L"jan");
+	KeyList.push_back(item);
 
-//50 --> 53
-L"daysago", L"weeksago", L"monthsago", L"yearsago"};
+	item.nID = COptionsDlg::February;
+	StringCchCopyW(item.wsText, 10, L"february");
+	KeyList.push_back(item);
 
-	//54
-	//-1 = invalid (do not check it anymore)
-	//otherwise, the value is position.
-	int checked[] =
-{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	item.nID = COptionsDlg::February;
+	StringCchCopyW(item.wsText, 10, L"feb");
+	KeyList.push_back(item);
 
-0, 0, 0, 0, 0, 0, 0,
-0, 0, 0, 0, 0, 0, 0,
+	item.nID = COptionsDlg::March;
+	StringCchCopyW(item.wsText, 10, L"march");
+	KeyList.push_back(item);
 
-0, 0, 0, 0, 0, 0,
-0, 0,
+	item.nID = COptionsDlg::March;
+	StringCchCopyW(item.wsText, 10, L"mar");
+	KeyList.push_back(item);
 
-0, 0, 0, 0,
-0, 0, 0, 0};
+	item.nID = COptionsDlg::April;
+	StringCchCopyW(item.wsText, 10, L"april");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::April;
+	StringCchCopyW(item.wsText, 10, L"apr");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::May;
+	StringCchCopyW(item.wsText, 10, L"may");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::June;
+	StringCchCopyW(item.wsText, 10, L"june");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::June;
+	StringCchCopyW(item.wsText, 10, L"jun");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::July;
+	StringCchCopyW(item.wsText, 10, L"july");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::July;
+	StringCchCopyW(item.wsText, 10, L"jul");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::August;
+	StringCchCopyW(item.wsText, 10, L"august");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::August;
+	StringCchCopyW(item.wsText, 10, L"aug");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::September;
+	StringCchCopyW(item.wsText, 10, L"september");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::September;
+	StringCchCopyW(item.wsText, 10, L"sep");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::October;
+	StringCchCopyW(item.wsText, 10, L"october");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::October;
+	StringCchCopyW(item.wsText, 10, L"oct");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::November;
+	StringCchCopyW(item.wsText, 10, L"november");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::November;
+	StringCchCopyW(item.wsText, 10, L"nov");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::December;
+	StringCchCopyW(item.wsText, 10, L"december");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::December;
+	StringCchCopyW(item.wsText, 10, L"dec");
+	KeyList.push_back(item);
+
+	//b. days of the week
+	item.nID = COptionsDlg::Monday;
+	StringCchCopyW(item.wsText, 10, L"monday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Monday;
+	StringCchCopyW(item.wsText, 10, L"mon");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Tuesday;
+	StringCchCopyW(item.wsText, 10, L"tuesday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Tuesday;
+	StringCchCopyW(item.wsText, 10, L"tue");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Wednesday;
+	StringCchCopyW(item.wsText, 10, L"wednesday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Wednesday;
+	StringCchCopyW(item.wsText, 10, L"wed");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Thursday;
+	StringCchCopyW(item.wsText, 10, L"thursday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Thursday;
+	StringCchCopyW(item.wsText, 10, L"thu");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Friday;
+	StringCchCopyW(item.wsText, 10, L"friday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Friday;
+	StringCchCopyW(item.wsText, 10, L"fri");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Saturday;
+	StringCchCopyW(item.wsText, 10, L"saturday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Saturday;
+	StringCchCopyW(item.wsText, 10, L"sat");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Sunday;
+	StringCchCopyW(item.wsText, 10, L"sunday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Sunday;
+	StringCchCopyW(item.wsText, 10, L"sun");
+	KeyList.push_back(item);
+
+	//this... (today,...)
+	item.nID = COptionsDlg::Today;
+	StringCchCopyW(item.wsText, 10, L"today");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::ThisWeek;
+	StringCchCopyW(item.wsText, 10, L"thisweek");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::ThisMonth;
+	StringCchCopyW(item.wsText, 10, L"thismonth");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::ThisYear;
+	StringCchCopyW(item.wsText, 10, L"thisyear");
+	KeyList.push_back(item);
+
+	//last...
+	item.nID = COptionsDlg::Yesterday;
+	StringCchCopyW(item.wsText, 10, L"yesterday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Yesterday;
+	StringCchCopyW(item.wsText, 10, L"lastday");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::LastWeek;
+	StringCchCopyW(item.wsText, 10, L"lastweek");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::LastMonth;
+	StringCchCopyW(item.wsText, 10, L"lastmonth");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::LastYear;
+	StringCchCopyW(item.wsText, 10, L"lastyear");
+	KeyList.push_back(item);
+
+	//anytime:
+	item.nID = COptionsDlg::Anytime;
+	StringCchCopyW(item.wsText, 10, L"anytime");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::Anytime;
+	StringCchCopyW(item.wsText, 10, L"any");
+	KeyList.push_back(item);
+
+	//days/weeks/months/years ago
+	item.nID = COptionsDlg::DaysAgo;
+	StringCchCopyW(item.wsText, 10, L"daysago");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::DaysAgo;
+	StringCchCopyW(item.wsText, 10, L"days");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::WeeksAgo;
+	StringCchCopyW(item.wsText, 10, L"weeksago");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::WeeksAgo;
+	StringCchCopyW(item.wsText, 10, L"weeks");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::MonthsAgo;
+	StringCchCopyW(item.wsText, 10, L"monthsago");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::MonthsAgo;
+	StringCchCopyW(item.wsText, 10, L"months");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::YearsAgo;
+	StringCchCopyW(item.wsText, 10, L"yearsago");
+	KeyList.push_back(item);
+
+	item.nID = COptionsDlg::YearsAgo;
+	StringCchCopyW(item.wsText, 10, L"years");
+	KeyList.push_back(item);
 
 	//compare the string from wsStart until wPos, to see if it is one of the keywords:
 	//i = position in the string
-	int i = 0, lastvalid = -1;
+	int i = 0;
 	for (WCHAR* wch = wsStart; wch != wPos; wch++, i++)
 	{
-		//j = the ordinal (ID) of the string
-		for (int j = 0; j < 54; j++)
+		CDoubleList<KEY>::Iterator J;
+		for (J = KeyList.begin(); J != NULL;)
 		{
-			//if it is still valid
-			if (*(checked + j) > -1)
-			{
-				//compare with the coresponding string:
-				if (*(*(wsKeys + j) + i) != *wch)
-					*(checked + j) = -1;
-				else lastvalid = j;
-			}
+			if (*(J->m_Value.wsText + i) != *wch)
+				KeyList.erase(J);
+			else J = J->pNext;
 		}
 
-		if (lastvalid == -1) break;
+		if (KeyList.is_empty()) break;
 	}
 
-	if (lastvalid > -1)
+	while (!KeyList.is_empty())
 	{
-		if (i < wcslen(*(wsKeys + lastvalid))) *(checked + lastvalid) = - 1;
-		if (*(checked + lastvalid) == - 1) lastvalid = 500;
+		if (i < (int)wcslen(KeyList.begin()->m_Value.wsText)) KeyList.pop_front();
+		//else i == len (it cannot be > because it would have been removed already)
+		else break;
 	}
 
-	//only one must be valid now: lastvalid
-	switch (lastvalid)
-	{
-		//months
-	case 0:
-	case 12:
-		key = COptionsDlg::January;
-		break;
+	if (KeyList.is_empty()) return false;
 
-	case 1:
-	case 13:
-		key = COptionsDlg::February;
-		break;
-
-	case 2:
-	case 14:
-		key = COptionsDlg::March;
-		break;
-
-	case 3:
-	case 15:
-		key = COptionsDlg::April;
-		break;
-
-	case 4:
-	case 16:
-		key = COptionsDlg::May;
-		break;
-
-	case 5:
-	case 17:
-		key = COptionsDlg::June;
-		break;
-
-	case 6:
-	case 18:
-		key = COptionsDlg::July;
-		break;
-
-	case 7:
-	case 19:
-		key = COptionsDlg::August;
-		break;
-
-	case 8:
-	case 20:
-		key = COptionsDlg::September;
-		break;
-
-	case 9:
-	case 21:
-		key = COptionsDlg::October;
-		break;
-
-	case 10:
-	case 22:
-		key = COptionsDlg::November;
-		break;
-		
-	case 11:
-	case 23:
-		key = COptionsDlg::December;
-		break;
-
-		//days of the week:
-	case 24:
-	case 31:
-		key = COptionsDlg::Monday;
-		break;
-
-	case 25:
-	case 32:
-		key = COptionsDlg::Tuesday;
-		break;
-
-	case 26:
-	case 33:
-		key = COptionsDlg::Wednesday;
-		break;
-
-	case 27:
-	case 34:
-		key = COptionsDlg::Thursday;
-		break;
-
-	case 28:
-	case 35:
-		key = COptionsDlg::Friday;
-		break;
-
-	case 29:
-	case 36:
-		key = COptionsDlg::Saturday;
-		break;
-
-	case 30:
-	case 37:
-		key = COptionsDlg::Sunday;
-		break;
-
-		//relative
-	case 38:
-		key = COptionsDlg::Today;
-		break;
-
-	case 39:
-		key = COptionsDlg::Yesterday;
-		break;
-
-	case 40:
-		key = COptionsDlg::LastDay;
-		break;
-
-	case 41:
-		key = COptionsDlg::LastWeek;
-		break;
-
-	case 42:
-		key = COptionsDlg::LastMonth;
-		break;
-
-	case 43:
-		key = COptionsDlg::LastYear;
-		break;
-
-	case 44:
-	case 45:
-		key = COptionsDlg::Anytime;
-		break;
-
-	case 46:
-	case 50:
-		key = COptionsDlg::Days;
-		break;
-
-	case 47:
-	case 51:
-		key = COptionsDlg::Weeks;
-		break;
-
-	case 48:
-	case 52:
-		key = COptionsDlg::Months;
-		break;
-
-	case 49:
-	case 53:
-		key = COptionsDlg::Years;
-		break;
-
-	default:
-		return false;
-	}
+	key = KeyList.begin()->m_Value.nID;
 
 	return true;
 }

@@ -87,12 +87,30 @@ struct ITEM
 	int len;
 };
 
+struct FILTER
+{
+	WCHAR* wsExt;
+	IClassFactory* pClassFactory;
+};
+
+struct FILTERLIST
+{
+	CDoubleList<FILTER>* pFilterList;
+	WCHAR letter;
+};
+
 class CSearchAppDlg
 {
 public:
 	HWND		m_hWnd;
 
 	enum KEYSIZE { Bytes, KBytes, MBytes, GBytes};
+
+private:
+	typedef BOOL (*CHARCHECKENC) (const BYTE* wcContents, const BYTE* wcSearch, DWORD& dwEnc, int* nr, int nrMaxSearch);
+	typedef BOOL (*SEARCHUSINGFILTER) (const WCHAR* wsFullName, const WCHAR* wsSearchContents, IClassFactory* pClassFactory, WIN32_FILE_ATTRIBUTE_DATA& data);
+	CHARCHECKENC CharCheckEnc;
+	SEARCHUSINGFILTER SearchUsingFilter;
 
 //PRIVATE DATA
 private:
@@ -105,10 +123,14 @@ private:
 	BOOL m_bSearchFast;
 	//the list of fileitems currently in the ListCtrl.
 	CDoubleList<FILEITEM> m_FileItems;
+	//the list of filters:
+	CDoubleList<FILTERLIST> m_FilterList;
 	//flags for enumeration.
 	SHCONTF m_ulEnumFlags;
 	QWORD m_SizeMin, m_SizeMax;
 	static WNDPROC		OldEditSizeProc;
+
+	static BOOL m_bStopSearch;
 
 	//UI
 	//the rectangles of controls: used for reposition/re-sizing.
@@ -129,21 +151,33 @@ private:
 	//strings:
 	WCHAR* m_wsSearchIn;
 	WCHAR* m_wsSearchFileName;
+	WCHAR* m_wsSearchContents;
 	//uses the same buffer as m_wsSearchFileName
 	WCHAR* m_wsSearchFileExt;
 	WCHAR m_wsDesktopPath[MAX_PATH];
+	WCHAR m_wsTempFolder[288];
+	int m_nTempFolderLen;
 
 	//handles to controls
 	HWND m_hSearchFileName;
+	HWND m_hSearchContents;
 	HWND m_hSearchIn;
 	HWND m_hListCtrl;
 	HWND m_hBrowse;
+	HICON m_hIcon;
+	static HWND m_hTaskWnd;
+
+	static HANDLE m_hSecondThread;
 
 	HWND		m_hSizeMin, m_hSizeMax;
+
+	ULONG m_uRegisteredValue;
 
 //PRIVATE FUNCTIONS
 private:
 	static INT_PTR CALLBACK DialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam);
+	static DWORD WINAPI SecondThread(CSearchAppDlg* pDlg);
+	static LRESULT CALLBACK SecondWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 	//MESSAGE HANDLERS
 	BOOL OnInitDialog(void);
@@ -182,6 +216,18 @@ private:
 	BOOL GetNextQWORD(QWORD& nr, WCHAR** wPos);
 	BOOL CheckSizeText(WCHAR* wsText, int len, QWORD& qwSize, BOOL bIsMin);
 	BOOL CheckSizes(void);
+	void WatchFolder(ITEMIDLIST* pidlFolder);
+	void OnShellNotify(WPARAM wParam, LPARAM lParam);
+
+	//shell notifications:
+	//file deleted
+	void OnNotifyDeleteFile(WCHAR* wsFileName);
+	//folder deleted
+	void OnNotifyDeleteFolder(WCHAR* wsFolderName);
+	//file renamed
+	void OnNotifyRenameFile(WCHAR* wsOldFileName, WCHAR* wsNewFileName);
+	//folder renamed
+	void OnNotifyRenameFolder(WCHAR* wsOldFolderName, WCHAR* wsNewFolderName);
 
 	//DATA RETRIEVAL
 	//retrieves the parent folder of the file wsFileName. It does not allocate new space. it only retrieves the first
@@ -192,6 +238,8 @@ private:
 	//It does not allocate new space. it only retrieves the first
 	//character of the extension.
 	inline void GetFileExt(const WCHAR* wsDisplayName, WCHAR** wsFileExt, BOOL bRetrieveDot = FALSE);
+	void LoadFilters();
+	void TryLoadFilter(const HKEY hParentKey, WCHAR* wsKeyName, WCHAR& lastchar);
 
 	//CHECKS
 	//checks an item: be it folder or file (pidlChild)
@@ -199,7 +247,19 @@ private:
 	//check the flags retrieved from pSearchFolder->GetAttributesOf()
 	inline BOOL CheckFlags(const ULONG& ulFlags);
 	//checks an item's attributes to see if it matches attributes' condition
-	bool CheckAttributes(const WIN32_FILE_ATTRIBUTE_DATA& data);
+	BOOL CheckAttributes(const WIN32_FILE_ATTRIBUTE_DATA& data);
+	//retrieve the next char available encodings, and the number of character it needs for each encoding.
+	BOOL GetNextChar(const BYTE* wPos, DWORD& dwEnc, DWORD nMax, int nr[]);
+	//retrieve the next char available encodings, and the number of character it needs for each encoding.
+	//if it needed more than it has, it returns false and bNeedMore is set to TRUE.
+	//nMaxFile = nr total of bytes left in the file. if there is still space in the file and bNeedMore is true,
+	//we can afford to return false and change the buffer. else, we need to return ANY encodings.
+	BOOL GetNextChar(const BYTE* wPos, DWORD& dwEnc, DWORD nMax, int nr[], BOOL& bNeedMore, const QWORD& nMaxFile);
+	//this is for Case Sensitive:
+	static BOOL CheckCharEncCS(const BYTE* wcContents, const BYTE* wcSearch, DWORD& dwEnc, int* nr, int nrMaxSearch);
+	//we retrieve each char as its encodings and compare it to the current character in the search str.
+	//the encodings that fail will have the "nr" set to 0.
+	static BOOL CheckCharEnc(const BYTE* wcContents, const BYTE* wcSearch, DWORD& dwEnc, int* nr, int nrMaxSearch);
 
 	//checks an item's extension name to see if it matches extension-name condition
 //	bool CheckExtName(WCHAR* wsFileExt);
@@ -207,6 +267,15 @@ private:
 //	bool CheckTitleName(WCHAR* wsDisplayName, WCHAR* wsFileExt);
 	//checks an item's title name to see if it matches title-name condition: case when there is no file extension
 	bool CheckDisplayName(WCHAR* wsDisplayName);
+
+	inline BOOL CheckFileContents(const WCHAR* wsFullName, const WCHAR* wsExtName, WIN32_FILE_ATTRIBUTE_DATA& data);
+	BOOL CheckDefaultContents(HANDLE hFile, LARGE_INTEGER& liSize);
+	IClassFactory* FindFilter(const WCHAR* wsExtName);
+	static BOOL SearchUsingFilterCS(const WCHAR* wsFullName, const WCHAR* wsSearchContents, IClassFactory* pClassFactory, WIN32_FILE_ATTRIBUTE_DATA& data);
+	static BOOL SearchUsingFilterNCS(const WCHAR* wsFullName, const WCHAR* wsSearchContents, IClassFactory* pClassFactory, WIN32_FILE_ATTRIBUTE_DATA& data);
+
+	BOOL CheckUTF8Char(BYTE* wcContents, WCHAR* wcSearch, int& nrChars, int& nrWCHARs);
+	BOOL GetNextUTF8Char(BYTE* wcContents, DWORD nMax, int& nr);
 
 //PUBLIC FUNCTIONS
 public:
@@ -216,7 +285,7 @@ public:
 	INT_PTR DoModal(void);
 	//similar to CWnd::ScreenToClient
 	inline void ScreenToClient(RECT& rect);
-	inline bool PathFileExistsEx(const WCHAR* wsPath);
+	inline bool PathFileExistsEx(const WCHAR* wsPath, BOOL bMustBeDir = FALSE);
 };
 
 #endif//SEARCHAPPDLG_H

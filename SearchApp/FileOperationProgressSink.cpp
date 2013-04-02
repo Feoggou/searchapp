@@ -3,7 +3,7 @@
 
 FileOperationProgressSink::FileOperationProgressSink(void)
 {
-	m_cRef = 0;//1;
+	m_cRef = 0;
 }
 
 
